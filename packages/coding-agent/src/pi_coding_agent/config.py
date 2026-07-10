@@ -292,6 +292,21 @@ def _global_default_seed() -> dict:
     return seed
 
 
+def _project_a2a_seed(cwd: str | None = None) -> dict:
+    base = cwd or os.getcwd()
+    name = os.path.basename(os.path.abspath(base)) or "agent"
+    slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in name).strip("-") or "agent"
+    return {
+        "self": {
+            "slug": slug,
+            "name": name,
+            "clarity_agent_id": None,
+        },
+        "agents": [],
+        "unknown_sender_policy": "surface_for_approval",
+    }
+
+
 def ensure_project_settings(cwd: str | None = None) -> str | None:
     """Guarantee <cwd>/.tau/settings.json exists, seeded from the global
     defaults, on EVERY launch — so a normal `tau` run never leaves a
@@ -304,6 +319,7 @@ def ensure_project_settings(cwd: str | None = None) -> str | None:
     config_dir = get_project_config_dir(base)
     settings_path = os.path.join(config_dir, "settings.json")
     seed = _global_default_seed()
+    seed.setdefault("a2a", _project_a2a_seed(base))
     if os.path.exists(settings_path):
         try:
             with open(settings_path, encoding="utf-8") as f:
@@ -443,7 +459,7 @@ def ensure_project_uv_runner(cwd: str | None = None) -> list[str]:
                         'name = "tau-agent-runner"',
                         'version = "0.1.0"',
                         'requires-python = ">=3.11,<3.15"',
-                        'dependencies = ["tau-by-clarity>=0.55.21"]',
+                        f'dependencies = ["tau-by-clarity=={VERSION}"]',
                         "",
                         "[tool.uv]",
                         "package = false",
@@ -485,8 +501,7 @@ def _tau_zsh_function_block() -> str:
             '  if [ -f "pyproject.toml" ] && grep -q "tau-by-clarity" "pyproject.toml" '
             "&& command -v uv >/dev/null 2>&1; then",
             '    if [ "${1:-}" = "update" ]; then',
-            '      shift',
-            '      uv add --upgrade-package tau-by-clarity tau-by-clarity "$@" && uv sync',
+            '      command tau "$@"',
             "    else",
             '      uv run python -m pi_coding_agent.main "$@"',
             "    fi",
@@ -593,8 +608,10 @@ def scaffold_project(cwd: str | None = None) -> list[str]:
         # self-contained right here in its own dir (not an empty {} that hides
         # what it's actually running). If no global defaults exist yet, this
         # stays empty until /login writes them.
+        settings_seed = _global_default_seed()
+        settings_seed.setdefault("a2a", _project_a2a_seed(base))
         with open(settings_path, "w", encoding="utf-8") as f:
-            f.write(json.dumps(_global_default_seed(), indent=2) + "\n")
+            f.write(json.dumps(settings_seed, indent=2) + "\n")
         created.append(settings_path)
 
     # Stand up the project-local memory store so it's present and git-trackable
