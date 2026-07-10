@@ -244,6 +244,24 @@ class MemoryStore:
                                  summary_id=r["summary_id"], created_at=r["created_at"])
                 for r in reversed(rows)]
 
+    def turns_since(self, since: float | None = None) -> list[ConversationTurn]:
+        """Return project conversation turns ordered oldest-first."""
+        if since is None:
+            rows = self._conn.execute(
+                "SELECT * FROM conversation_memory WHERE project=? ORDER BY created_at ASC",
+                (self.project_root,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM conversation_memory WHERE project=? AND created_at>? "
+                "ORDER BY created_at ASC",
+                (self.project_root, since),
+            ).fetchall()
+        return [ConversationTurn(id=r["id"], project=r["project"], role=r["role"],
+                                 content=r["content"], scope_id=r["scope_id"],
+                                 summary_id=r["summary_id"], created_at=r["created_at"])
+                for r in rows]
+
     # ── durable tool/conversation expansion read paths ──────────────────────
 
     def record_tool_log(

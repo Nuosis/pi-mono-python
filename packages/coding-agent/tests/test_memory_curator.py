@@ -101,6 +101,67 @@ def test_no_direct_active_write_for_needs_review(tmp_path):
     s.close()
 
 
+def test_explicit_user_preference_commits_when_llm_extracts_nothing(tmp_path):
+    """Regression for live sessions where curator ran but committed_count stayed 0.
+
+    This proves the curator itself promotes an explicit user preference into
+    active semantic memory even when the model extractor returns no candidates.
+    """
+    s = _store(tmp_path)
+    c = Curator(StubLlm([]), s)
+    evidence = [
+        Evidence(
+            "u1",
+            "user_turn",
+            (
+                "I want a new procedural rule: when listing ClickUp primitives, "
+                "list the title or semantically rich tags, not the id."
+            ),
+        ),
+        Evidence(
+            "a1",
+            "assistant_output",
+            "Understood. I will use titles first.",
+        ),
+    ]
+
+    written = c.curate_and_commit(evidence)
+
+    assert len(written) == 1
+    memory = s.get(written[0])
+    assert memory is not None
+    assert memory.memory_type == "preference"
+    assert memory.status == "active"
+    assert "ClickUp primitives" in memory.content
+    assert "title or semantically rich tags" in memory.content
+    assert memory.metadata["source_ids"] == ["u1"]
+    assert s.search("ClickUp primitive title rich tags")[0].memory.id == written[0]
+    s.close()
+
+
+def test_explicit_procedural_instruction_commits_when_llm_extracts_nothing(tmp_path):
+    s = _store(tmp_path)
+    c = Curator(StubLlm([]), s)
+    evidence = [
+        Evidence(
+            "u1",
+            "user_turn",
+            "When I give you a command, consider that approval; do not request approval again.",
+        ),
+    ]
+
+    written = c.curate_and_commit(evidence)
+
+    assert len(written) == 1
+    memory = s.get(written[0])
+    assert memory is not None
+    assert memory.memory_type == "preference"
+    assert "consider that approval" in memory.content
+    assert memory.metadata["source_ids"] == ["u1"]
+    assert s.search("approval command")[0].memory.id == written[0]
+    s.close()
+
+
 class AsyncStubLlm:
     def __init__(self, decisions, supported=True):
         self.decisions = decisions
