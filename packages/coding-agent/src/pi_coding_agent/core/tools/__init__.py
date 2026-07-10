@@ -5,6 +5,7 @@ from .bash import create_bash_tool, bash_tool
 from .grep import create_grep_tool, grep_tool
 from .find import create_find_tool, find_tool
 from .ls import create_ls_tool, ls_tool
+from .goal import create_goal_tools
 from .truncate import (
     DEFAULT_MAX_BYTES,
     DEFAULT_MAX_LINES,

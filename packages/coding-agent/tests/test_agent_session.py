@@ -327,7 +327,10 @@ class TestToolManagement:
     def test_set_active_tools_by_name(self, agent_session):
         agent_session.set_active_tools_by_name(["bash", "read"])
         active = agent_session.get_active_tool_names()
-        assert set(active) == {"bash", "read"}
+        assert {"bash", "read"} <= set(active)
+        assert {"get_goal", "set_goal", "update_goal", "clear_goal"} <= set(active)
+        assert "write" not in active
+        assert "edit" not in active
         # System prompt should be rebuilt to reflect new tool set
         prompt = agent_session.system_prompt
         assert "bash" in prompt

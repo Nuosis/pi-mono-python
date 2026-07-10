@@ -152,7 +152,7 @@ def test_ensure_zsh_tau_alias_appends_managed_function(tmp_path) -> None:
     assert created_again is None
     assert text.count("tau managed shell function") == 2
     assert 'grep -q "tau-by-clarity" "pyproject.toml"' in text
-    assert 'uv add --upgrade-package tau-by-clarity tau-by-clarity "$@" && uv sync' in text
+    assert 'command tau "$@"' in text
     assert "command tau update" not in text
     assert 'uv run python -m pi_coding_agent.main "$@"' in text
     assert 'command tau "$@"' in text
@@ -181,7 +181,7 @@ def test_ensure_zsh_tau_alias_replaces_existing_managed_function(tmp_path) -> No
     assert "# before" in text
     assert "# after" in text
     assert text.count("tau()") == 1
-    assert 'uv add --upgrade-package tau-by-clarity tau-by-clarity "$@" && uv sync' in text
+    assert 'command tau "$@"' in text
     assert "command tau update" not in text
     assert 'uv run python -m pi_coding_agent.main "$@"' in text
     assert '  uv run tau "$@"\n}' not in text
@@ -326,6 +326,11 @@ def test_dispatch_to_local_project_updates_project_then_syncs(tmp_path, monkeypa
     def fake_run(args: list[str], env: dict[str, str]):
         assert env["TAU_LOCAL_DISPATCH"] == "1"
         calls.append(args)
+        if "tau-by-clarity>=0" in args:
+            (proj / "uv.lock").write_text(
+                'version = 1\n\n[[package]]\nname = "tau-by-clarity"\nversion = "9.9.9"\n',
+                encoding="utf-8",
+            )
         return _Result()
 
     monkeypatch.delenv("TAU_LOCAL_DISPATCH", raising=False)
@@ -344,8 +349,9 @@ def test_dispatch_to_local_project_updates_project_then_syncs(tmp_path, monkeypa
             str(proj),
             "--upgrade-package",
             "tau-by-clarity",
-            "tau-by-clarity",
+            "tau-by-clarity>=0",
         ],
+        ["uv", "add", "--project", str(proj), "tau-by-clarity==9.9.9"],
         ["uv", "sync", "--project", str(proj)],
     ]
 

@@ -122,6 +122,7 @@ class AgentSession:
         self._extension_bindings: dict[str, Any] = {}
         self._steering_mode_override: str | None = None
         self._follow_up_mode_override: str | None = None
+        self._goal_terminated: bool = False
         self._current_goal = self._initial_goal_from_settings()
 
         if session_manager is not None:
@@ -157,6 +158,7 @@ class AgentSession:
             transform_context=self._transform_context,
             on_payload=self._on_provider_payload,
             on_response=self._on_provider_response,
+            shouldStopAfterTurn=self._should_stop_after_turn,
             beforeToolCall=self._before_tool_call,
             afterToolCall=self._after_tool_call,
         )
@@ -262,6 +264,29 @@ class AgentSession:
                     scope_project=getattr(self._memory_scope, "project", None),
                     model_id=model_name,
                 )
+                try:
+                    from .memory.dream import run_scheduled_dream
+
+                    dream_result = run_scheduled_dream(memory_root)
+                    log_event(
+                        "memory.dream_checked",
+                        session_id=self.session_id,
+                        memory_root=memory_root,
+                        ran=dream_result.ran,
+                        reason=dream_result.reason,
+                        next_dream_at=dream_result.next_dream_at,
+                        written_count=(
+                            len(dream_result.dream.written_ids)
+                            if dream_result.dream is not None else 0
+                        ),
+                    )
+                except Exception as exc:
+                    try:
+                        from .cli_debug_log import log_exception
+                        log_exception("memory.dream_failed", exc,
+                                      session_id=self.session_id)
+                    except Exception:
+                        pass
         except Exception as exc:
             try:
                 from .cli_debug_log import log_exception
@@ -280,6 +305,14 @@ class AgentSession:
         self._memory_conv_cursor = 0  # index of last message appended to conversation_memory
 
     def _initial_goal_from_settings(self) -> str | None:
+        try:
+            from .goal import load_goal
+
+            goal = load_goal(self.cwd, session_id=self.session_id or "default")
+            if goal and goal.status == "active":
+                return goal.objective
+        except Exception:
+            pass
         session_vars = self._settings.session_vars or {}
         goal = session_vars.get("GOAL")
         if isinstance(goal, str) and goal.strip():
@@ -287,6 +320,13 @@ class AgentSession:
         return None
 
     def _effective_system_prompt(self) -> str:
+        try:
+            from .goal import load_goal
+
+            goal = load_goal(self.cwd, session_id=self.session_id or "default")
+            self._current_goal = goal.objective if goal and goal.status == "active" else None
+        except Exception:
+            pass
         if not self._current_goal:
             return self._base_system_prompt
         return (
@@ -298,6 +338,17 @@ class AgentSession:
 
     def set_current_goal(self, goal: str | None) -> str | None:
         value = (goal or "").strip()
+        try:
+            from .goal import clear_goal, set_goal
+
+            sid = self.session_id or "default"
+            if value:
+                set_goal(self.cwd, session_id=sid, objective=value)
+            else:
+                clear_goal(self.cwd, session_id=sid)
+                self._mark_goal_terminated()
+        except Exception:
+            pass
         self._current_goal = value or None
         if self._settings.session_vars is None:
             self._settings.session_vars = {}
@@ -309,7 +360,61 @@ class AgentSession:
         return self._current_goal
 
     def get_current_goal(self) -> str | None:
+        try:
+            from .goal import load_goal
+
+            goal = load_goal(self.cwd, session_id=self.session_id or "default")
+            if goal and goal.status == "active":
+                self._current_goal = goal.objective
+                return goal.objective
+            if goal and goal.status in {"complete", "blocked"}:
+                self._current_goal = None
+                self._mark_goal_terminated()
+                return None
+        except Exception:
+            pass
         return self._current_goal
+
+    def _active_goal_state(self):
+        try:
+            from .goal import load_goal
+
+            goal = load_goal(self.cwd, session_id=self.session_id or "default")
+            if goal and goal.status == "active":
+                return goal
+        except Exception:
+            return None
+        return None
+
+    def _mark_goal_terminated(self) -> None:
+        """Signal that the session's goal was cleared or reached a terminal status.
+
+        Once set, the agent loop will exit at the next opportunity instead of
+        continuing autonomously toward a now-irrelevant objective.
+        """
+        self._goal_terminated = True
+
+    async def _should_stop_after_turn(self, turn_context: dict[str, Any]) -> bool:
+        del turn_context
+        if self._goal_terminated:
+            return True
+        goal = self._active_goal_state()
+        if goal is None:
+            return False
+        text = (
+            "Continue working toward the active Tau goal.\n\n"
+            f"Objective: {goal.objective}\n"
+            "If the objective is now fully achieved, call update_goal with "
+            "status complete. If progress is genuinely blocked by missing "
+            "required input or an external state change, call update_goal with "
+            "status blocked and explain the reason. Otherwise continue the work."
+        )
+        self._agent.follow_up(UserMessage(
+            role="user",
+            content=[TextContent(type="text", text=text)],
+            timestamp=int(time.time() * 1000),
+        ))
+        return False
 
     # ── Tool construction ─────────────────────────────────────────────────────
 
@@ -324,6 +429,18 @@ class AgentSession:
             create_find_tool(self.cwd),
             create_ls_tool(self.cwd),
         ]
+        try:
+            from .tools import create_goal_tools
+
+            tools.extend(
+                create_goal_tools(
+                    self.cwd,
+                    session_id=self.session_id or "default",
+                    on_goal_terminated=self._mark_goal_terminated,
+                )
+            )
+        except Exception:
+            pass
         for extension_tool in self._extension_runner.get_all_registered_tools():
             try:
                 tools.append(
@@ -352,7 +469,12 @@ class AgentSession:
 
     def _tools_for_names(self, tool_names: list[str]) -> list[AgentTool]:
         tools_by_name = {tool.name: tool for tool in self._all_tools}
-        return [tools_by_name[name] for name in tool_names if name in tools_by_name]
+        selected = [tools_by_name[name] for name in tool_names if name in tools_by_name]
+        for native_name in ("get_goal", "set_goal", "update_goal", "clear_goal"):
+            tool = tools_by_name.get(native_name)
+            if tool is not None and all(existing.name != native_name for existing in selected):
+                selected.append(tool)
+        return selected
 
     def _build_system_prompt(self, selected_tools: list[str]) -> str:
         loader = self._resource_loader
