@@ -212,7 +212,7 @@ class TestArgParsing:
         captured = capsys.readouterr()
         assert "pi" in captured.out.lower() or "usage" in captured.out.lower()
         assert "uninstall <source> [-l]" in captured.out
-        assert "update [self|pi|all]" in captured.out
+        assert "update [self|pi|tau|all]" in captured.out
         assert "config [--no-approve]" in captured.out
         assert "Show help for install/remove/uninstall/update/list" in captured.out
         assert "--session <path|id>" in captured.out
