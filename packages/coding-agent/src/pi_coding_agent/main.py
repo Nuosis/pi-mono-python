@@ -1239,6 +1239,12 @@ async def _run(args: Sequence[str]) -> int:
     session = result.session
     event_unsub = attach_session_event_logging(session)
     log_session_snapshot("created", session)
+    # CLI `--goal <text>` seeds the in-memory session goal. No disk write;
+    # the goal tools (when explicitly opted in via settings.json's tools list)
+    # remain the only path to mutate the goal thereafter.
+    if getattr(parsed, "goal", None):
+        session.set_current_goal(parsed.goal)
+        log_event("goal_seeded_from_cli", session_id=session.session_id)
     if parsed.name:
         session.session_manager.append_session_info(parsed.name)
         log_event("session_named", name=parsed.name)

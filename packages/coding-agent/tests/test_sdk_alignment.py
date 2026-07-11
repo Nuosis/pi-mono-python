@@ -120,7 +120,7 @@ class TestSDKAlignment:
         assert "Append prompt from loader." in prompt
         assert "Project context from loader." in prompt
         assert "Skill body content for parity." in prompt
-        assert result.session.get_active_tool_names() == ["read", "get_goal", "set_goal", "update_goal", "clear_goal"]
+        assert result.session.get_active_tool_names() == ["read"]
 
     @pytest.mark.asyncio
     async def test_session_vars_substitute_in_system_prompt(self, tmp_path):
@@ -183,7 +183,7 @@ class TestSDKAlignment:
             )
         )
 
-        assert result.session.get_active_tool_names() == ["get_goal", "set_goal", "update_goal", "clear_goal"]
+        assert result.session.get_active_tool_names() == []
         assert "Available tools:\n(none)" in result.session.system_prompt
 
     @pytest.mark.asyncio
@@ -229,7 +229,7 @@ class TestSDKAlignment:
             )
         )
 
-        assert result.session.get_active_tool_names() == ["get_goal", "set_goal", "update_goal", "clear_goal"]
+        assert result.session.get_active_tool_names() == []
         assert "Available tools:\n(none)" in result.session.system_prompt
         assert result.session._settings.name == "Devin"
         assert result.session._settings.memory_enabled is True
@@ -267,7 +267,7 @@ class TestSDKAlignment:
             )
         )
 
-        assert result.session.get_active_tool_names() == ["subagent", "get_goal", "set_goal", "update_goal", "clear_goal"]
+        assert result.session.get_active_tool_names() == ["subagent"]
 
     @pytest.mark.asyncio
     async def test_default_active_tools_match_node_harness(self, tmp_path):
@@ -279,7 +279,7 @@ class TestSDKAlignment:
             )
         )
 
-        assert result.session.get_active_tool_names() == ["read", "bash", "edit", "write", "get_goal", "set_goal", "update_goal", "clear_goal"]
+        assert result.session.get_active_tool_names() == ["read", "bash", "edit", "write"]
 
     @pytest.mark.asyncio
     async def test_custom_tool_definitions_are_registered_and_active(self, tmp_path):
@@ -312,10 +312,6 @@ class TestSDKAlignment:
             "edit",
             "write",
             "custom_lookup",
-            "get_goal",
-            "set_goal",
-            "update_goal",
-            "clear_goal",
         ]
 
     @pytest.mark.asyncio
@@ -363,10 +359,6 @@ class TestSDKAlignment:
             "edit",
             "write",
             "extension_lookup",
-            "get_goal",
-            "set_goal",
-            "update_goal",
-            "clear_goal",
         ]
 
         tool = next(t for t in result.session.agent.state.tools if t.name == "extension_lookup")
@@ -1150,7 +1142,7 @@ class TestSDKAlignment:
         assert session.session_id != old_id
         assert session.session_file != old_file
         assert session.messages == []
-        assert session.get_active_tool_names() == ["read", "bash", "edit", "write", "get_goal", "set_goal", "update_goal", "clear_goal"]
+        assert session.get_active_tool_names() == ["read", "bash", "edit", "write"]
 
     @pytest.mark.asyncio
     async def test_clone_session_switches_to_copied_session(self, tmp_path):
@@ -2188,7 +2180,7 @@ class TestSDKAlignment:
             )
         )
         assert result.session.cwd == str(tmp_path)
-        assert result.session.get_active_tool_names() == ["read", "get_goal", "set_goal", "update_goal", "clear_goal"]
+        assert result.session.get_active_tool_names() == ["read"]
 
         calls: list[dict[str, object]] = []
 

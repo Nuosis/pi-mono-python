@@ -36,6 +36,41 @@ from .auth_storage import AuthStorage
 from .compaction import compact_context, should_compact
 
 
+@dataclasses.dataclass
+class SessionGoal:
+    """In-memory session goal state. Lives on AgentSession; never persisted.
+
+    `status` transitions:
+      - "active"   — current; the agent continues working toward it
+      - "complete" — terminal; signals the agent loop to stop
+      - "blocked"  — terminal; signals the agent loop to stop
+    """
+
+    objective: str
+    status: str = "active"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in ("complete", "blocked")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"objective": self.objective, "status": self.status}
+
+
+def _goal_tool_matches(name: str) -> bool:
+    """True if `name` opts a goal tool into the active set."""
+    if name in _GOAL_TOOL_NAMES_SET or name == _GOAL_ALIAS:
+        return True
+    return False
+
+
+_GOAL_TOOL_NAMES_SET: frozenset[str] = frozenset(
+    {"get_goal", "set_goal", "update_goal", "clear_goal"}
+)
+_GOAL_ALIAS = "goal"
+_GOAL_TERMINAL_STATUSES = frozenset({"complete", "blocked"})
+
+
 def _active_compression_on() -> bool:
     """True when active compression (Headroom/CCR) is enabled — in which case
     proactive summarization compaction stands down (it's the fallback)."""
@@ -123,7 +158,8 @@ class AgentSession:
         self._steering_mode_override: str | None = None
         self._follow_up_mode_override: str | None = None
         self._goal_terminated: bool = False
-        self._current_goal = self._initial_goal_from_settings()
+        self._goal: SessionGoal | None = None
+        self._current_goal = self._initial_goal_from_session_vars()
 
         if session_manager is not None:
             self._session_manager = session_manager
@@ -304,87 +340,109 @@ class AgentSession:
         self._memory_cursor = 0  # index of last message curated into memory
         self._memory_conv_cursor = 0  # index of last message appended to conversation_memory
 
-    def _initial_goal_from_settings(self) -> str | None:
-        try:
-            from .goal import load_goal
+    def _initial_goal_from_session_vars(self) -> str | None:
+        """Read the goal seed from session_vars only. No disk, no settings file.
 
-            goal = load_goal(self.cwd, session_id=self.session_id or "default")
-            if goal and goal.status == "active":
-                return goal.objective
-        except Exception:
-            pass
+        The CLI `--goal <text>` path lands in `session_vars["GOAL"]`; this is
+        where it surfaces at session construction. Goal tools (when enabled)
+        and the prompt assembly read from this same in-memory state.
+        """
         session_vars = self._settings.session_vars or {}
         goal = session_vars.get("GOAL")
         if isinstance(goal, str) and goal.strip():
-            return goal.strip()
+            value = goal.strip()
+            self._goal = SessionGoal(objective=value, status="active")
+            return value
         return None
 
-    def _effective_system_prompt(self) -> str:
-        try:
-            from .goal import load_goal
+    @property
+    def goal_state(self) -> SessionGoal | None:
+        """Read-only view of the in-memory session goal. None if no goal is set."""
+        return self._goal
 
-            goal = load_goal(self.cwd, session_id=self.session_id or "default")
-            self._current_goal = goal.objective if goal and goal.status == "active" else None
-        except Exception:
-            pass
-        if not self._current_goal:
+    def _sync_goal_session_var(self) -> None:
+        """Mirror the in-memory goal into session_vars["GOAL"].
+
+        The session_vars entry is the visible side-effect that survives a
+        settings round-trip; it never touches the filesystem.
+        """
+        if self._settings.session_vars is None:
+            self._settings.session_vars = {}
+        if self._goal is not None and self._goal.status == "active":
+            self._settings.session_vars["GOAL"] = self._goal.objective
+        else:
+            self._settings.session_vars.pop("GOAL", None)
+
+    def _effective_system_prompt(self) -> str:
+        # Pure in-memory read. No disk I/O.
+        goal = self._goal
+        if goal is None or goal.status != "active":
             return self._base_system_prompt
         return (
             f"{self._base_system_prompt}\n\n"
             "# Active Goal\n\n"
-            f"{self._current_goal}\n\n"
+            f"{goal.objective}\n\n"
             "Treat this as the current session goal until it is cleared or changed."
         )
 
     def set_current_goal(self, goal: str | None) -> str | None:
-        value = (goal or "").strip()
-        try:
-            from .goal import clear_goal, set_goal
+        """Set or clear the in-memory session goal. No disk write.
 
-            sid = self.session_id or "default"
-            if value:
-                set_goal(self.cwd, session_id=sid, objective=value)
-            else:
-                clear_goal(self.cwd, session_id=sid)
-                self._mark_goal_terminated()
-        except Exception:
-            pass
-        self._current_goal = value or None
-        if self._settings.session_vars is None:
-            self._settings.session_vars = {}
-        if self._current_goal:
-            self._settings.session_vars["GOAL"] = self._current_goal
+        Callers that want to fire the loop terminator (signal "we're done")
+        should use `update_goal_status("complete"|"blocked")` or `clear_goal()`
+        — those are the tool-side paths. `set_current_goal("")` is the
+        CLI/dev-null reset path; it must NOT terminate the loop.
+        """
+        value = (goal or "").strip()
+        if value:
+            carry_status = (
+                self._goal.status
+                if self._goal is not None
+                and self._goal.status in ("active", "complete", "blocked")
+                else "active"
+            )
+            self._goal = SessionGoal(objective=value, status=carry_status)
         else:
-            self._settings.session_vars.pop("GOAL", None)
-        self._agent.set_system_prompt(self._effective_system_prompt())
+            self._goal = None
+        self._sync_goal_session_var()
+        self._current_goal = self.get_current_goal()
         return self._current_goal
+
+    def update_goal_status(self, status: str) -> None:
+        """Flip the goal's status. No-op if no goal is set.
+
+        Transitions to 'complete' or 'blocked' signal the agent loop to stop
+        after the current turn.
+        """
+        if status not in ("active", "complete", "blocked"):
+            raise ValueError(f"unknown goal status: {status!r}")
+        if self._goal is None:
+            return
+        old_status = self._goal.status
+        self._goal = SessionGoal(objective=self._goal.objective, status=status)
+        self._sync_goal_session_var()
+        self._current_goal = self.get_current_goal()
+        was_active = old_status == "active"
+        became_terminal = status in _GOAL_TERMINAL_STATUSES
+        if was_active and became_terminal:
+            self._mark_goal_terminated()
+
+    def clear_goal(self) -> None:
+        """Drop the goal entirely and signal the loop to stop after this turn."""
+        previous = self._goal
+        self._goal = None
+        self._sync_goal_session_var()
+        self._current_goal = None
+        if previous is not None:
+            self._mark_goal_terminated()
 
     def get_current_goal(self) -> str | None:
-        try:
-            from .goal import load_goal
-
-            goal = load_goal(self.cwd, session_id=self.session_id or "default")
-            if goal and goal.status == "active":
-                self._current_goal = goal.objective
-                return goal.objective
-            if goal and goal.status in {"complete", "blocked"}:
-                self._current_goal = None
-                self._mark_goal_terminated()
-                return None
-        except Exception:
-            pass
-        return self._current_goal
-
-    def _active_goal_state(self):
-        try:
-            from .goal import load_goal
-
-            goal = load_goal(self.cwd, session_id=self.session_id or "default")
-            if goal and goal.status == "active":
-                return goal
-        except Exception:
-            return None
+        if self._goal is not None and self._goal.status == "active":
+            return self._goal.objective
         return None
+
+    def _active_goal_state(self) -> SessionGoal | None:
+        return self._goal
 
     def _mark_goal_terminated(self) -> None:
         """Signal that the session's goal was cleared or reached a terminal status.
@@ -429,18 +487,12 @@ class AgentSession:
             create_find_tool(self.cwd),
             create_ls_tool(self.cwd),
         ]
-        try:
+        # Goal tools are opt-in: register only when at least one goal tool
+        # name (or the "goal" alias) appears in the active set. Cost is zero
+        # otherwise — no create_goal_tools import, no instance creation.
+        if self._active_names_include_goal_tool():
             from .tools import create_goal_tools
-
-            tools.extend(
-                create_goal_tools(
-                    self.cwd,
-                    session_id=self.session_id or "default",
-                    on_goal_terminated=self._mark_goal_terminated,
-                )
-            )
-        except Exception:
-            pass
+            tools.extend(create_goal_tools(self))
         for extension_tool in self._extension_runner.get_all_registered_tools():
             try:
                 tools.append(
@@ -470,11 +522,34 @@ class AgentSession:
     def _tools_for_names(self, tool_names: list[str]) -> list[AgentTool]:
         tools_by_name = {tool.name: tool for tool in self._all_tools}
         selected = [tools_by_name[name] for name in tool_names if name in tools_by_name]
-        for native_name in ("get_goal", "set_goal", "update_goal", "clear_goal"):
-            tool = tools_by_name.get(native_name)
-            if tool is not None and all(existing.name != native_name for existing in selected):
-                selected.append(tool)
+        # If "goal" alias was named, expand it to the four goal tool names.
+        if _GOAL_ALIAS in tool_names:
+            for goal_name in _GOAL_TOOL_NAMES_SET:
+                tool = tools_by_name.get(goal_name)
+                if tool is not None and all(existing.name != goal_name for existing in selected):
+                    selected.append(tool)
         return selected
+
+    def _active_names_include_goal_tool(self) -> bool:
+        """True when any of the active tool names opts a goal tool in.
+
+        Honors both the goal-alias ("goal") and explicit per-tool names.
+        Called only at construction time before the active list has been
+        finalized, so we read from the explicit requested names / settings.
+        """
+        names: set[str] = set()
+        initial = getattr(self, "_initial_active_tool_names", None)
+        if initial is not None:
+            names.update(initial)
+        # Settings file's `tools` list is also opt-in source when ctor didn't
+        # pass initial_active_tool_names.
+        settings_tools = (self._settings.tools
+                          if hasattr(self._settings, "tools") else None)
+        if settings_tools:
+            names.update(settings_tools)
+        if not names:
+            return False
+        return bool(names & (_GOAL_TOOL_NAMES_SET | {_GOAL_ALIAS}))
 
     def _build_system_prompt(self, selected_tools: list[str]) -> str:
         loader = self._resource_loader
