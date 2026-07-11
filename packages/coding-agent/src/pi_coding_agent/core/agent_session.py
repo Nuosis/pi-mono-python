@@ -159,6 +159,11 @@ class AgentSession:
         self._follow_up_mode_override: str | None = None
         self._goal_terminated: bool = False
         self._goal: SessionGoal | None = None
+        self._initial_active_tool_names: list[str] | None = (
+            list(initial_active_tool_names)
+            if initial_active_tool_names is not None
+            else None
+        )
         self._current_goal = self._initial_goal_from_session_vars()
 
         if session_manager is not None:
@@ -169,13 +174,27 @@ class AgentSession:
         self.session_id = self._session_manager.get_session_id()
         self._extension_runner = self._create_extension_runner()
 
-        # Build all tools; keep registry for set_active_tools_by_name
+        # Build all tools; keep registry for set_active_tools_by_name.
+        # Order of precedence for the default active list:
+        #   1. ctor `initial_active_tool_names` if explicitly passed
+        #   2. settings.json's `tools` list (read via self._settings_manager)
+        #   3. hardcoded ["read", "bash", "edit", "write"] as a final fallback
+        # The settings file is authoritative when ctor didn't override it.
         self._all_tools: list[AgentTool] = self._build_tools()
-        active_names = (
-            list(initial_active_tool_names)
-            if initial_active_tool_names is not None
-            else ["read", "bash", "edit", "write"]
-        )
+        if initial_active_tool_names is not None:
+            active_names = list(initial_active_tool_names)
+        else:
+            settings_obj = (
+                self._settings_manager.get()
+                if self._settings_manager is not None else None
+            )
+            settings_tools = (
+                getattr(settings_obj, "tools", None) if settings_obj is not None else None
+            )
+            if settings_tools:
+                active_names = list(settings_tools)
+            else:
+                active_names = ["read", "bash", "edit", "write"]
         active_tools = self._tools_for_names(active_names)
 
         # Resolve model
@@ -545,15 +564,26 @@ class AgentSession:
         Honors both the goal-alias ("goal") and explicit per-tool names.
         Called only at construction time before the active list has been
         finalized, so we read from the explicit requested names / settings.
+
+        Settings come from `self._settings_manager` (the disk-loaded
+        SettingsManager), NOT from `self._settings` — the latter is a
+        bare `Settings()` default-constructed by the ctor when no Settings
+        instance is passed in, and so its `tools` field is always None.
+        The manager is what reads <cwd>/.tau/settings.json and the global
+        ~/.tau/agent/settings.json.
         """
         names: set[str] = set()
         initial = getattr(self, "_initial_active_tool_names", None)
         if initial is not None:
             names.update(initial)
-        # Settings file's `tools` list is also opt-in source when ctor didn't
-        # pass initial_active_tool_names.
-        settings_tools = (self._settings.tools
-                          if hasattr(self._settings, "tools") else None)
+        # Settings file's `tools` list is also opt-in source when ctor
+        # didn't pass initial_active_tool_names.
+        manager_settings = (
+            self._settings_manager.get() if self._settings_manager is not None else None
+        )
+        settings_tools = (
+            getattr(manager_settings, "tools", None) if manager_settings is not None else None
+        )
         if settings_tools:
             names.update(settings_tools)
         if not names:
