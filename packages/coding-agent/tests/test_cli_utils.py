@@ -82,6 +82,52 @@ class TestArgParsing:
         from pi_coding_agent.cli_sub.args import parse_args
         args = parse_args(["-r"])
         assert args.resume is True
+        assert args.session is None
+
+    def test_parse_resume_with_uuid(self):
+        # Regression: `tau --resume <id>` must capture the session ID and
+        # signal resume intent, not treat the ID as a positional message.
+        from pi_coding_agent.cli_sub.args import parse_args
+        args = parse_args(["--resume", "6ba1c407-fe45-4213-a2b1-78c004b2c8f5"])
+        assert args.resume is True
+        assert args.session == "6ba1c407-fe45-4213-a2b1-78c004b2c8f5"
+        assert args.messages == []
+
+    def test_parse_resume_short_flag_with_uuid(self):
+        from pi_coding_agent.cli_sub.args import parse_args
+        args = parse_args(["-r", "6ba1c407-fe45-4213-a2b1-78c004b2c8f5"])
+        assert args.resume is True
+        assert args.session == "6ba1c407-fe45-4213-a2b1-78c004b2c8f5"
+        assert args.messages == []
+
+    def test_parse_resume_with_path(self):
+        from pi_coding_agent.cli_sub.args import parse_args
+        args = parse_args(["--resume", "/tmp/session.jsonl"])
+        assert args.resume is True
+        assert args.session == "/tmp/session.jsonl"
+        assert args.messages == []
+
+    def test_parse_resume_does_not_swallow_following_flag(self):
+        # The peek-ahead must NOT consume the next argument when it's a flag.
+        from pi_coding_agent.cli_sub.args import parse_args
+        args = parse_args(["--resume", "--print", "hello"])
+        assert args.resume is True
+        assert args.session is None
+        assert args.print_mode is True
+        assert args.messages == ["hello"]
+
+        args = parse_args(["--resume", "--model", "claude"])
+        assert args.resume is True
+        assert args.session is None
+        assert args.model == "claude"
+
+    def test_parse_resume_does_not_swallow_at_path(self):
+        # Matches the existing `--session` policy: `@file` paths are handled
+        # elsewhere (select_session), not consumed as a session argument.
+        from pi_coding_agent.cli_sub.args import parse_args
+        args = parse_args(["--resume", "@somefile"])
+        assert args.resume is True
+        assert args.session is None
 
     def test_parse_print(self):
         from pi_coding_agent.cli_sub.args import parse_args

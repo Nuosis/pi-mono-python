@@ -126,6 +126,20 @@ def parse_args(
         elif arg in ("--continue", "-c"):
             result.continue_ = True
         elif arg in ("--resume", "-r"):
+            # Optional positional: `tau --resume <id>` (or `-r <id>`) should
+            # resume that session directly instead of opening the interactive
+            # picker. Same lookahead discipline as `--session` and the
+            # other value-taking flags.
+            next_resume_arg = args[i + 1] if i + 1 < len(args) else None
+            if (
+                next_resume_arg is not None
+                and not next_resume_arg.startswith("-")
+                and not next_resume_arg.startswith("@")
+            ):
+                result.session = next_resume_arg
+                result.resume = True
+                i += 2
+                continue
             result.resume = True
         elif arg == "--provider" and i + 1 < len(args):
             i += 1
@@ -354,7 +368,8 @@ Options:
   --mode <mode>                  Output mode: text (default), json, or rpc
   --print, -p                    Non-interactive mode: process prompt and exit
   --continue, -c                 Continue previous session
-  --resume, -r                   Select a session to resume
+  --resume, -r [<id|path>]       Resume the given session, or open the
+                                 interactive picker if omitted
   --session <path|id>            Use specific session file or partial UUID
   --session-id <id>              Use exact project session ID, creating it if missing
   --fork <path|id>               Fork specific session file or partial UUID into a new session

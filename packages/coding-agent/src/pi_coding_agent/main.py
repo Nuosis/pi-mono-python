@@ -971,19 +971,28 @@ async def _run(args: Sequence[str]) -> int:
     if migrated_auth_providers and parsed.verbose:
         print(f"Migrated auth providers: {', '.join(migrated_auth_providers)}", file=sys.stderr)
 
-    # --resume: interactive session picker
+    # --resume: open the interactive picker, unless the user already named a
+    # session on the command line (`tau --resume <id>` / `-r <id>`), in
+    # which case load that session directly and skip the picker.
     if parsed.resume:
-        log_event("resume_picker_start")
-        selected = await select_session(
-            lambda: SessionManager.list(cwd, parsed.session_dir),
-            SessionManager.list_all,
-        )
-        if not selected:
-            print("No session selected")
-            log_event("resume_picker_cancelled")
-            return 0
-        log_event("resume_picker_selected", selected=selected)
-        sm = SessionManager.open(selected)
+        if parsed.session:
+            log_event("resume_direct", session=parsed.session)
+            sm = await _create_session_manager(parsed, cwd)
+            if sm is None:
+                print(f"Could not resolve session: {parsed.session}", file=sys.stderr)
+                return 1
+        else:
+            log_event("resume_picker_start")
+            selected = await select_session(
+                lambda: SessionManager.list(cwd, parsed.session_dir),
+                SessionManager.list_all,
+            )
+            if not selected:
+                print("No session selected")
+                log_event("resume_picker_cancelled")
+                return 0
+            log_event("resume_picker_selected", selected=selected)
+            sm = SessionManager.open(selected)
         resolved_model, thinking = _resolve_model_for_session(parsed, model_registry, settings_manager)
         resource_loader = await _create_resource_loader(parsed, cwd, settings_manager)
         result = await create_agent_session(
