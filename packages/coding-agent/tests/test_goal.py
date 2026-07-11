@@ -102,11 +102,17 @@ def test_set_current_goal_with_empty_string_clears() -> None:
 
 
 def test_set_current_goal_does_not_trigger_terminator() -> None:
-    # CLI / direct set_current_goal should NOT fire the terminator — only
-    # the goal tools (set_complete / clear) should.
+    # set_current_goal is a pure state mutation. It must never fire the
+    # terminator regardless of whether it sets or clears. The terminator
+    # belongs to clear_goal() and update_goal_status("complete"|"blocked").
     session = _FakeSession()
     session.set_current_goal("x")
+    assert session._terminated_count == 0
     session.set_current_goal("")
+    assert session._terminated_count == 0
+    # Repeating a set doesn't accumulate terminator hits either.
+    session.set_current_goal("y")
+    session.set_current_goal("y")
     assert session._terminated_count == 0
 
 

@@ -386,12 +386,35 @@ class AgentSession:
         )
 
     def set_current_goal(self, goal: str | None) -> str | None:
-        """Set or clear the in-memory session goal. No disk write.
+        """Pure state mutation on `self._goal`. Never fires the terminator.
 
-        Callers that want to fire the loop terminator (signal "we're done")
-        should use `update_goal_status("complete"|"blocked")` or `clear_goal()`
-        — those are the tool-side paths. `set_current_goal("")` is the
-        CLI/dev-null reset path; it must NOT terminate the loop.
+        This method is the setter. It is used by:
+          - the CLI `--goal <text>` path (state seed at launch),
+          - the TUI `/goal <text>` path (replace the goal mid-session).
+
+        `set_current_goal(None)` is the same shape: a state mutation, not a
+        completion signal. It does NOT fire `self._goal_terminated`. The
+        rationale: the loop's continuation policy is independent of goal
+        state — sessions run without a goal, with one, or after clearing one.
+        The terminator belongs to a different verb.
+
+        To signal "the goal-phase is over; let the loop exit," callers must
+        use `clear_goal()` (which fires the terminator) or
+        `update_goal_status("complete"|"blocked")` (which fires on a
+        non-active status transition). The TUI `/goal clear` command routes
+        to `clear_goal()` for exactly this reason.
+
+        Why is CLI `--goal ""` a no-op reset but `/goal clear` exits the
+        loop? Same shape of state mutation, opposite loop consequences.
+        Because at launch there's no running loop to terminate, so the
+        asymmetry is the timing — not the user's intent to commit.
+
+        Args:
+            goal: objective string (non-empty) to set, or None/empty to
+                clear the in-memory goal without firing the terminator.
+
+        Returns:
+            The new `get_current_goal()` value (None if no active goal).
         """
         value = (goal or "").strip()
         if value:

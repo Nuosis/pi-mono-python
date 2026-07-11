@@ -1514,10 +1514,25 @@ async def _run_pi_tui(
             arg = stripped[6:].strip() if stripped.startswith("/goal ") else ""
             getter = getattr(session, "get_current_goal", None)
             setter = getattr(session, "set_current_goal", None)
+            clearer = getattr(session, "clear_goal", None)
             if arg.lower() in {"clear", "unset", "reset", "off"}:
-                if callable(setter):
+                # /goal clear is a user-side "we're done with the goal-phase"
+                # signal. Route to clear_goal() so the loop's outer driver
+                # sees the terminator fire — set_current_goal(None) is a
+                # pure-state mutation that does NOT terminate, and that
+                # asymmetry is intentional. CLI --goal "" at launch uses
+                # set_current_goal(None) because there's no running loop to
+                # terminate yet; here, mid-session, the loop is alive, and
+                # the user's clear intent says "stop asking me about the
+                # goal; go through the goal-completion exit."
+                if callable(clearer):
+                    clearer()
+                    append_history(dim("Goal cleared."))
+                elif callable(setter):
                     setter(None)
-                append_history(dim("Goal cleared."))
+                    append_history(dim("Goal cleared."))
+                else:
+                    append_history(dim("This session does not support goals."))
             elif arg:
                 if callable(setter):
                     setter(arg)
