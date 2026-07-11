@@ -441,9 +441,6 @@ class AgentSession:
             return self._goal.objective
         return None
 
-    def _active_goal_state(self) -> SessionGoal | None:
-        return self._goal
-
     def _mark_goal_terminated(self) -> None:
         """Signal that the session's goal was cleared or reached a terminal status.
 
@@ -453,26 +450,15 @@ class AgentSession:
         self._goal_terminated = True
 
     async def _should_stop_after_turn(self, turn_context: dict[str, Any]) -> bool:
+        # Enforcement is binary: the goal-loop machinery flips
+        # `self._goal_terminated` when a tool transitions the goal to a
+        # terminal status, and the agent loop honors that flag here.
+        # No prompt-level enforcement. No "Continue working toward..." user
+        # message. The model pursues the goal because the user told it to
+        # in their messages; the goal state on the session is what gives
+        # the loop its stopping decision.
         del turn_context
-        if self._goal_terminated:
-            return True
-        goal = self._active_goal_state()
-        if goal is None:
-            return False
-        text = (
-            "Continue working toward the active Tau goal.\n\n"
-            f"Objective: {goal.objective}\n"
-            "If the objective is now fully achieved, call update_goal with "
-            "status complete. If progress is genuinely blocked by missing "
-            "required input or an external state change, call update_goal with "
-            "status blocked and explain the reason. Otherwise continue the work."
-        )
-        self._agent.follow_up(UserMessage(
-            role="user",
-            content=[TextContent(type="text", text=text)],
-            timestamp=int(time.time() * 1000),
-        ))
-        return False
+        return bool(self._goal_terminated)
 
     # ── Tool construction ─────────────────────────────────────────────────────
 
@@ -3288,5 +3274,7 @@ def _safe_json(obj: Any) -> Any:
     except Exception:
         try:
             return str(obj)
+        except Exception:
+            return "<unserializable>"
         except Exception:
             return "<unserializable>"
