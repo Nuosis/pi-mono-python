@@ -2202,6 +2202,7 @@ class AgentSession:
             "sessionManager": lambda: self._session_manager,
             "modelRegistry": lambda: self._model_registry,
             "model": lambda: self.model,
+            "messages": lambda: list(self._agent.state.messages),
             "session_vars": lambda: dict(self._settings.session_vars or {}),
             "sessionVars": lambda: dict(self._settings.session_vars or {}),
             "signal": bindings.get("signal"),

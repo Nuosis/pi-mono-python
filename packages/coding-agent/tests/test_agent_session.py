@@ -101,6 +101,16 @@ async def test_agent_session_persists_messages(agent_session, session_dir):
 
 
 @pytest.mark.asyncio
+async def test_extension_context_receives_live_agent_messages(agent_session):
+    await agent_session.prompt("Hello!")
+
+    context = agent_session.extension_runner.create_context()
+
+    assert context.messages == agent_session.state.messages
+    assert [message.role for message in context.messages] == ["user", "assistant"]
+
+
+@pytest.mark.asyncio
 async def test_agent_session_subscribe_events(agent_session):
     events = []
     unsub = agent_session.subscribe(events.append)
