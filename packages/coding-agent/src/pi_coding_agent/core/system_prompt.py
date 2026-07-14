@@ -222,12 +222,61 @@ def _load_file(cwd: str, filename: str) -> str | None:
 
 
 def _format_skills(selected_tools: list[str] | None, skills: list[dict[str, str]]) -> str:
-    """Format skills section for system prompt (mirrors formatSkillsForPrompt in TS)."""
+    """Format skills as a lightweight index — progressive disclosure.
+
+    Only ``name`` + ``description`` + ``location`` go into the system prompt; the
+    full SKILL.md body is loaded ON DEMAND (via the read tool) when a task
+    matches a skill's description. Concatenating every skill body here previously
+    bloated the prompt (e.g. 12 skills → ~100K chars) and drowned the agent's
+    own persona/voice instructions. Mirrors ``core.skills.format_skills_for_prompt``.
+
+    Falls back to a short snippet of ``content`` as the description only when a
+    skill dict carries no ``description`` (legacy callers), never the full body.
+    """
     if not skills:
         return ""
-    parts = ["\n\n## Skills\n"]
+
+    # If the agent has no read tool it cannot load a skill body on demand, so
+    # fall back to inlining the bodies (legacy behaviour). When read IS available
+    # (the normal case), use progressive disclosure below.
+    has_read = selected_tools is None or "read" in selected_tools
+    if not has_read:
+        parts = ["\n\n## Skills\n"]
+        for skill in skills:
+            name = skill.get("name", "unknown")
+            content = str(skill.get("content") or "").strip()
+            parts.append(f"### {name}\n{content}")
+        return "\n\n".join(parts)
+
+    def _esc(s: str) -> str:
+        return (
+            s.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+            .replace("'", "&apos;")
+        )
+
+    lines = [
+        "\n\nThe following skills provide specialized instructions for specific tasks.",
+        "Use the read tool to load a skill's file (its location) when the task matches "
+        "its description. When a skill file references a relative path, resolve it against "
+        "the skill directory (the parent of SKILL.md) and use that absolute path.",
+        "",
+        "<available_skills>",
+    ]
     for skill in skills:
-        name = skill.get("name", "unknown")
-        content = skill.get("content", "").strip()
-        parts.append(f"### {name}\n{content}")
-    return "\n\n".join(parts)
+        name = str(skill.get("name") or "unknown")
+        description = str(skill.get("description") or "").strip()
+        location = str(skill.get("location") or skill.get("file_path") or "").strip()
+        if not description:
+            body = str(skill.get("content") or "").strip()
+            description = (body[:200] + "…") if len(body) > 200 else body
+        lines.append("  <skill>")
+        lines.append(f"    <name>{_esc(name)}</name>")
+        lines.append(f"    <description>{_esc(description)}</description>")
+        if location:
+            lines.append(f"    <location>{_esc(location)}</location>")
+        lines.append("  </skill>")
+    lines.append("</available_skills>")
+    return "\n".join(lines)

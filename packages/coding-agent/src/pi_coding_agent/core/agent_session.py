@@ -385,11 +385,20 @@ class AgentSession:
         )
 
     def _skills_for_prompt(self, loaded_skills: list[Any]) -> list[dict[str, str]]:
+        # Progressive disclosure: surface only each skill's metadata + location.
+        # The full SKILL.md body is loaded on demand (via the read tool) when a
+        # task matches the description — NOT read and concatenated into every
+        # prompt, which drowned the agent's own persona/voice instructions.
         skills: list[dict[str, str]] = []
         for skill in loaded_skills:
             name = getattr(skill, "name", None)
             if not isinstance(name, str):
                 continue
+            description = getattr(skill, "description", None) or ""
+            location = getattr(skill, "file_path", None) or ""
+            # content is retained for the no-read-tool inline fallback in
+            # _format_skills; it is NOT placed in the prompt when the agent can
+            # load skills on demand (the normal, read-tool-available path).
             content = getattr(skill, "content", None)
             if not isinstance(content, str):
                 file_path = getattr(skill, "file_path", None)
@@ -401,7 +410,14 @@ class AgentSession:
                         content = ""
                 else:
                     content = ""
-            skills.append({"name": name, "content": content})
+            skills.append(
+                {
+                    "name": name,
+                    "description": str(description),
+                    "location": str(location),
+                    "content": content,
+                }
+            )
         return skills
 
     def _create_extension_runner(
