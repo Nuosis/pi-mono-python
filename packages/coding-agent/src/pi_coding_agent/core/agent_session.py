@@ -51,6 +51,7 @@ from .model_registry import ModelRegistry
 from .session_manager import SessionManager
 from .settings_manager import Settings, SettingsManager
 from .system_prompt import build_system_prompt
+from .clarity_instrumentation import emit as _instr_emit
 from .tools import (
     create_bash_tool,
     create_edit_tool,
@@ -165,6 +166,25 @@ class AgentSession:
         self._agent.set_system_prompt(self._effective_system_prompt())
         self._agent.set_tools(active_tools)
         self._agent.set_thinking_level(self._settings.thinking_level)
+
+        # Instrumentation: record the effective system prompt + model + tool set
+        # the brain actually starts with. This is the ground truth that was
+        # previously invisible when a live flow ran the wrong prompt.
+        try:
+            _instr_emit(
+                "tau.session_start",
+                input={
+                    "system_prompt": self._effective_system_prompt(),
+                    "cwd": getattr(self, "cwd", None) or getattr(self._settings, "cwd", None),
+                    "tools": [getattr(t, "name", str(t)) for t in active_tools],
+                },
+                metadata={
+                    "phase": "session_start",
+                    "model": getattr(resolved_model, "id", None),
+                },
+            )
+        except Exception:  # noqa: BLE001 — telemetry must never break init
+            pass
 
         self._listeners: list[Callable[[AgentEvent], None]] = []
         self._agent.subscribe(self._on_agent_event)
@@ -516,11 +536,30 @@ class AgentSession:
         return key
 
     async def _on_provider_payload(self, payload: Any, model: Model | None = None) -> Any:
+        # Instrumentation: the exact request handed to the provider — system
+        # prompt, message history, and tools — the definitive record of what the
+        # brain received on this turn.
+        try:
+            _instr_emit(
+                "tau.provider_request",
+                input=payload,
+                metadata={"phase": "provider_request", "model": getattr(model, "id", None)},
+            )
+        except Exception:  # noqa: BLE001
+            pass
         if not self._extension_runner.has_handlers("before_provider_request"):
             return payload
         return await self._extension_runner.emit_before_provider_request(payload)
 
     async def _on_provider_response(self, response: Any, model: Model | None = None) -> None:
+        try:
+            _instr_emit(
+                "tau.provider_response",
+                output=response,
+                metadata={"phase": "provider_response", "model": getattr(model, "id", None)},
+            )
+        except Exception:  # noqa: BLE001
+            pass
         if not self._extension_runner.has_handlers("after_provider_response"):
             return None
         await self._extension_runner.emit_after_provider_response(response)
@@ -531,12 +570,20 @@ class AgentSession:
         context: dict[str, Any],
         signal: asyncio.Event | None = None,
     ) -> dict[str, Any] | None:
-        if not self._extension_runner.has_handlers("tool_call"):
-            return None
         tool_call = context.get("toolCall") or context.get("tool_call")
         tool_name = getattr(tool_call, "name", "")
         tool_call_id = getattr(tool_call, "id", "")
         args = context.get("args") or {}
+        try:
+            _instr_emit(
+                "tau.tool_call",
+                input={"tool_name": tool_name, "tool_call_id": tool_call_id, "args": args},
+                metadata={"phase": "tool_call", "tool_name": tool_name},
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        if not self._extension_runner.has_handlers("tool_call"):
+            return None
         try:
             return await self._extension_runner.emit_tool_call({
                 "type": "tool_call",
@@ -556,8 +603,6 @@ class AgentSession:
         context: dict[str, Any],
         signal: asyncio.Event | None = None,
     ) -> dict[str, Any] | None:
-        if not self._extension_runner.has_handlers("tool_result"):
-            return None
         tool_call = context.get("toolCall") or context.get("tool_call")
         tool_name = getattr(tool_call, "name", "")
         tool_call_id = getattr(tool_call, "id", "")
@@ -566,6 +611,17 @@ class AgentSession:
         is_error = bool(context.get("isError", context.get("is_error", False)))
         content = result.get("content", []) if isinstance(result, dict) else getattr(result, "content", [])
         details = result.get("details") if isinstance(result, dict) else getattr(result, "details", None)
+        try:
+            _instr_emit(
+                "tau.tool_result",
+                input={"tool_name": tool_name, "tool_call_id": tool_call_id},
+                output={"content": content, "details": details, "is_error": is_error},
+                metadata={"phase": "tool_result", "tool_name": tool_name, "is_error": is_error},
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        if not self._extension_runner.has_handlers("tool_result"):
+            return None
         hook_result = await self._extension_runner.emit_tool_result({
             "type": "tool_result",
             "toolName": tool_name,
