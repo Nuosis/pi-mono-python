@@ -168,6 +168,13 @@ class AgentSession:
         self._agent.set_tools(active_tools)
         self._agent.set_thinking_level(self._settings.thinking_level)
 
+        # A supplied SessionManager may point at an existing JSONL session.
+        # Restore that branch before extensions receive their first input event
+        # so extension context and provider context observe the same history.
+        initial_context = self._session_manager.build_context()
+        if initial_context.messages:
+            self._agent.replace_messages(initial_context.messages)
+
         # Instrumentation: record the effective system prompt + model + tool set
         # the brain actually starts with. This is the ground truth that was
         # previously invisible when a live flow ran the wrong prompt.

@@ -77,6 +77,25 @@ def agent_session(session_dir, monkeypatch):
     return session
 
 
+def test_agent_session_restores_supplied_session_context(session_dir, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    manager = SessionManager.create(cwd=session_dir, session_dir=session_dir)
+    manager.append_message(
+        {"role": "user", "content": "previous turn", "timestamp": _ts()}
+    )
+    reopened = SessionManager.open(manager.get_session_file())
+
+    session = AgentSession(
+        cwd=session_dir,
+        model=get_model("anthropic", "claude-3-5-sonnet-20241022"),
+        settings=Settings(auto_compact=False),
+        session_manager=reopened,
+    )
+
+    assert len(session.state.messages) == 1
+    assert session.extension_runner.create_context().messages == session.state.messages
+
+
 @pytest.mark.asyncio
 async def test_agent_session_creates_session_id(agent_session):
     assert agent_session.session_id
