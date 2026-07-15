@@ -494,6 +494,26 @@ async def stream_simple(
     content_blocks: list[Any] = []
     block_index_map: dict[int, int] = {}  # anthropic index → content_blocks index
     tool_arg_buffers: dict[int, str] = {}
+    raw_response_events: list[Any] = []
+    final_response_message: Any | None = None
+    response_notified = False
+
+    async def notify_response() -> None:
+        """Expose the raw SDK response once, including partial failed streams."""
+        nonlocal response_notified
+        callback = opts.get("on_response")
+        if callback is None or response_notified:
+            return
+        response_notified = True
+        result = callback(
+            {
+                "events": list(raw_response_events),
+                "final_message": final_response_message,
+            },
+            model,
+        )
+        if hasattr(result, "__await__"):
+            await result
 
     params = await apply_on_payload(params, model, opts.get("on_payload"))
 
@@ -502,6 +522,9 @@ async def stream_simple(
     try:
         async with client.messages.stream(**params) as ant_stream:
             async for event in ant_stream:
+                # Preserve the provider-native event before any Tau parsing or
+                # normalization can discard information needed for diagnosis.
+                raw_response_events.append(event)
                 event_type = type(event).__name__
 
                 if event_type == "RawMessageStartEvent":
@@ -669,8 +692,8 @@ async def stream_simple(
 
             # Get final message from stream
             try:
-                final_msg = await ant_stream.get_final_message()
-                u = final_msg.usage
+                final_response_message = await ant_stream.get_final_message()
+                u = final_response_message.usage
                 usage = Usage(
                     input=u.input_tokens,
                     output=u.output_tokens,
@@ -679,10 +702,12 @@ async def stream_simple(
                 )
                 usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write
 
-                stop_reason = _STOP_REASON_MAP.get(final_msg.stop_reason or "end_turn", "stop")
+                stop_reason = _STOP_REASON_MAP.get(final_response_message.stop_reason or "end_turn", "stop")
             except Exception:
                 usage = partial.usage
                 stop_reason = partial.stop_reason
+
+            await notify_response()
 
             # Check cancellation
             signal = getattr(opts, "signal", None)
@@ -709,6 +734,7 @@ async def stream_simple(
                 yield EventDone(type="done", reason=stop_reason, message=final)
 
     except Exception as e:
+        await notify_response()
         signal = getattr(opts, "signal", None)
         _is_set_fn = getattr(signal, "is_set", None)
         is_aborted = bool(signal and callable(_is_set_fn) and _is_set_fn())
@@ -726,3 +752,8 @@ async def stream_simple(
             timestamp=int(time.time() * 1000),
         )
         yield EventError(type="error", reason=stop, error=error_msg)
+    except BaseException:
+        # Cancellation/async-generator close must not erase a partial raw
+        # response; the original cancellation still propagates unchanged.
+        await notify_response()
+        raise

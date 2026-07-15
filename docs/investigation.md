@@ -15,3 +15,58 @@ Regression tests using `AsyncMock` for `responses.create` verified the SDK call 
 
 ## Current Hypothesis
 Root cause found: the OpenAI/Azure Responses providers were using legacy dict output plus an un-awaited async SDK call while the shared processor expects typed assistant output and an async iterator.
+
+---
+
+## Claire voice post-tool timeout — 2026-07-15
+
+### Problem
+
+The production `claire_ea` voice session on `/google-voice/session2` received
+“ask for Anastasia, do you see it?”, completed three read-only action lookups,
+then produced neither a final transcript nor audio. The Tau 0.56.13 trace
+contained `tau.provider_request` for the post-tool turn but no
+`tau.provider_response`.
+
+### Observable success
+
+For every Anthropic-compatible provider turn, including MiniMax, Tau emits one
+raw response envelope containing the SDK stream events and final SDK message.
+If iteration or parsing fails, it still emits the events received before the
+failure. The exact Claire production replay must then show the initial and
+post-tool provider responses, successful read-only tool results, persisted
+`transcript_out`, and non-empty audio output.
+
+### Hypothesis list
+
+| # | Hypothesis | Null hypothesis | Status |
+|---|------------|-----------------|--------|
+| 1 | Tau's Anthropic provider never invokes `on_response` | The adapter invokes the configured callback for every provider turn | CONFIRMED; repaired in 0.56.14 candidate |
+| 2 | The 90-second gap was provider unavailability | The exact captured MiniMax request can start and complete promptly | FALSIFIED by a direct 3.478-second streamed replay |
+| 3 | The tool results lacked the requested record | The read tools returned Anastasia records before the final turn | FALSIFIED by production `voice_events` and tool-result readback |
+
+### Current hypothesis
+
+Tau 0.56.13 wires `AgentSession._on_provider_response` into
+`SimpleStreamOptions`, but `pi_ai.providers.anthropic.stream_simple` never calls
+it. This is a provider-adapter control-plane defect. Repair the adapter callback
+contract first, then replay the unchanged production scenario and use the newly
+visible raw response to isolate any remaining tool-choice or stream-lifecycle
+failure.
+
+### Repair evidence
+
+- Contract tests first failed with zero callbacks on both completed and broken
+  streams, then passed after the adapter change. A third test proves closing a
+  partially consumed async stream still emits the response received so far.
+- The adjacent provider/stream slice passed 46 tests from workspace source.
+- The built 0.56.14 wheel passed its response-instrumentation and stream tests
+  from a clean installed environment (9 tests).
+- A disposable container using the Claire server's real MiniMax credential
+  loaded the candidate wheel directly, completed a MiniMax-M3 turn in 1.273
+  seconds, and captured one serializable envelope with nine raw events and a
+  final SDK message.
+
+This evidence proves the provider callback contract. It does not yet prove the
+Claire voice workflow; that requires publishing, deploying, and replaying the
+exact production route and utterance.

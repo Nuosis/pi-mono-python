@@ -235,6 +235,159 @@ class TestAnthropicProviderAuth:
         assert "X-Api-Key" not in kwargs["default_headers"]
 
 
+class TestAnthropicProviderResponseInstrumentation:
+    class RawProviderEvent:
+        pass
+
+    class RawContentBlockStartEvent:
+        index = 0
+        content_block = SimpleNamespace(type="text")
+
+    class FakeAnthropicStream:
+        def __init__(self, raw_event, final_message, *, error=None):
+            self.raw_event = raw_event
+            self.final_message = final_message
+            self.error = error
+            self.iteration = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.iteration == 0:
+                self.iteration += 1
+                return self.raw_event
+            if self.error is not None:
+                raise self.error
+            raise StopAsyncIteration
+
+        async def get_final_message(self):
+            return self.final_message
+
+    class FakeStreamContext:
+        def __init__(self, stream):
+            self.stream = stream
+
+        async def __aenter__(self):
+            return self.stream
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    @staticmethod
+    def _client_for(stream):
+        messages = SimpleNamespace(stream=lambda **_kwargs: TestAnthropicProviderResponseInstrumentation.FakeStreamContext(stream))
+        return SimpleNamespace(messages=messages)
+
+    @staticmethod
+    def _final_message():
+        return SimpleNamespace(
+            usage=SimpleNamespace(
+                input_tokens=7,
+                output_tokens=3,
+                cache_read_input_tokens=2,
+                cache_creation_input_tokens=0,
+            ),
+            stop_reason="end_turn",
+        )
+
+    @pytest.mark.asyncio
+    async def test_anthropic_emits_one_raw_response_envelope(self):
+        from pi_ai.providers import anthropic as anthropic_provider
+        from pi_ai.types import SimpleStreamOptions
+
+        raw_event = self.RawProviderEvent()
+        final_message = self._final_message()
+        stream = self.FakeAnthropicStream(raw_event, final_message)
+        responses = []
+
+        async def on_response(response, model):
+            responses.append((response, model))
+
+        with patch(
+            "pi_ai.providers.anthropic._build_client",
+            return_value=(self._client_for(stream), False),
+        ):
+            events = [
+                event
+                async for event in anthropic_provider.stream_simple(
+                    _make_model(provider="minimax"),
+                    _make_context(),
+                    SimpleStreamOptions(api_key="test-key", on_response=on_response),
+                )
+            ]
+
+        assert events[-1].type == "done"
+        assert len(responses) == 1
+        envelope, callback_model = responses[0]
+        assert envelope["events"] == [raw_event]
+        assert envelope["final_message"] is final_message
+        assert callback_model.provider == "minimax"
+
+    @pytest.mark.asyncio
+    async def test_anthropic_emits_partial_raw_response_when_stream_fails(self):
+        from pi_ai.providers import anthropic as anthropic_provider
+        from pi_ai.types import SimpleStreamOptions
+
+        raw_event = self.RawProviderEvent()
+        stream = self.FakeAnthropicStream(
+            raw_event,
+            self._final_message(),
+            error=RuntimeError("stream broke after first event"),
+        )
+        responses = []
+
+        async def on_response(response, _model):
+            responses.append(response)
+
+        with patch(
+            "pi_ai.providers.anthropic._build_client",
+            return_value=(self._client_for(stream), False),
+        ):
+            events = [
+                event
+                async for event in anthropic_provider.stream_simple(
+                    _make_model(provider="minimax"),
+                    _make_context(),
+                    SimpleStreamOptions(api_key="test-key", on_response=on_response),
+                )
+            ]
+
+        assert events[-1].type == "error"
+        assert len(responses) == 1
+        assert responses[0]["events"] == [raw_event]
+        assert responses[0]["final_message"] is None
+
+    @pytest.mark.asyncio
+    async def test_anthropic_emits_partial_raw_response_when_consumer_closes_stream(self):
+        from pi_ai.providers import anthropic as anthropic_provider
+        from pi_ai.types import SimpleStreamOptions
+
+        raw_event = self.RawContentBlockStartEvent()
+        stream = self.FakeAnthropicStream(raw_event, self._final_message())
+        responses = []
+
+        async def on_response(response, _model):
+            responses.append(response)
+
+        with patch(
+            "pi_ai.providers.anthropic._build_client",
+            return_value=(self._client_for(stream), False),
+        ):
+            provider_stream = anthropic_provider.stream_simple(
+                _make_model(provider="minimax"),
+                _make_context(),
+                SimpleStreamOptions(api_key="test-key", on_response=on_response),
+            )
+            assert (await anext(provider_stream)).type == "start"
+            assert (await anext(provider_stream)).type == "text_start"
+            await provider_stream.aclose()
+
+        assert len(responses) == 1
+        assert responses[0]["events"] == [raw_event]
+        assert responses[0]["final_message"] is None
+
+
 # ---------------------------------------------------------------------------
 # Provider stream functions return EventStream
 # ---------------------------------------------------------------------------
