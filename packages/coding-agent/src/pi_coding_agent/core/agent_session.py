@@ -158,6 +158,7 @@ class AgentSession:
             transform_context=self._transform_context,
             on_payload=self._on_provider_payload,
             on_response=self._on_provider_response,
+            prepareNextTurn=self._prepare_next_turn,
             beforeToolCall=self._before_tool_call,
             afterToolCall=self._after_tool_call,
         )
@@ -579,6 +580,13 @@ class AgentSession:
         if not self._extension_runner.has_handlers("after_provider_response"):
             return None
         await self._extension_runner.emit_after_provider_response(response)
+        return None
+
+    async def _prepare_next_turn(self, turn_context: dict[str, Any]) -> None:
+        """Expose the in-loop turn boundary to extensions before final output."""
+        if not self._extension_runner.has_handlers("turn_end"):
+            return None
+        await self._extension_runner.emit({"type": "turn_end", **turn_context})
         return None
 
     async def _before_tool_call(
@@ -2262,6 +2270,8 @@ class AgentSession:
             "shutdown": shutdown_handler,
             "getContextUsage": self.get_context_usage,
             "compact": _compact,
+            "sendMessage": self.send_custom_message,
+            "sendUserMessage": self.send_user_message,
             "getSystemPrompt": lambda: self.system_prompt,
             "getRegisteredCommands": self._extension_runner.get_registered_commands,
             "getCommandDiagnostics": lambda: [],
