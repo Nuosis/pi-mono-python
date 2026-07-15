@@ -7,6 +7,7 @@ and stream function scaffolding for bedrock, vertex, azure, responses, codex.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -40,6 +41,10 @@ def _make_context(messages=None, system_prompt=None, tools=None):
     ctx.system_prompt = system_prompt
     ctx.tools = tools or []
     return ctx
+
+
+async def _collect_async(stream):
+    return [event async for event in stream]
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +391,180 @@ class TestAnthropicProviderResponseInstrumentation:
         assert len(responses) == 1
         assert responses[0]["events"] == [raw_event]
         assert responses[0]["final_message"] is None
+
+    @pytest.mark.asyncio
+    async def test_minimax_retries_once_when_stream_is_idle_before_first_event(
+        self, monkeypatch
+    ):
+        from pi_ai.providers import anthropic as anthropic_provider
+        from pi_ai.types import SimpleStreamOptions
+
+        class IdleStream:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.Event().wait()
+
+            async def get_final_message(self):
+                raise AssertionError("an idle stream has no final message")
+
+        raw_event = self.RawProviderEvent()
+        final_message = self._final_message()
+        streams = [
+            IdleStream(),
+            self.FakeAnthropicStream(raw_event, final_message),
+        ]
+        calls = []
+
+        def open_stream(**_kwargs):
+            calls.append(1)
+            return self.FakeStreamContext(streams.pop(0))
+
+        client = SimpleNamespace(messages=SimpleNamespace(stream=open_stream))
+        responses = []
+
+        async def on_response(response, _model):
+            responses.append(response)
+
+        monkeypatch.setenv("TAU_PROVIDER_STREAM_IDLE_TIMEOUT_SECONDS", "0.01")
+        with patch(
+            "pi_ai.providers.anthropic._build_client",
+            return_value=(client, False),
+        ):
+            events = await asyncio.wait_for(
+                _collect_async(
+                    anthropic_provider.stream_simple(
+                        _make_model(provider="minimax"),
+                        _make_context(),
+                        SimpleStreamOptions(
+                            api_key="test-key", on_response=on_response
+                        ),
+                    )
+                ),
+                timeout=0.5,
+            )
+
+        assert events[-1].type == "done"
+        assert len(calls) == 2
+        assert len(responses) == 1
+        assert responses[0]["events"] == [raw_event]
+        assert responses[0]["final_message"] is final_message
+        assert responses[0]["idle_retries"] == 1
+
+    @pytest.mark.asyncio
+    async def test_minimax_does_not_retry_after_provider_emits_an_event(
+        self, monkeypatch
+    ):
+        from pi_ai.providers import anthropic as anthropic_provider
+        from pi_ai.types import SimpleStreamOptions
+
+        raw_event = self.RawProviderEvent()
+
+        class PartialIdleStream:
+            def __init__(self):
+                self.iteration = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.iteration == 0:
+                    self.iteration += 1
+                    return raw_event
+                await asyncio.Event().wait()
+
+            async def get_final_message(self):
+                raise AssertionError("a partial idle stream has no final message")
+
+        calls = []
+
+        def open_stream(**_kwargs):
+            calls.append(1)
+            return self.FakeStreamContext(PartialIdleStream())
+
+        client = SimpleNamespace(messages=SimpleNamespace(stream=open_stream))
+        responses = []
+
+        async def on_response(response, _model):
+            responses.append(response)
+
+        monkeypatch.setenv("TAU_PROVIDER_STREAM_IDLE_TIMEOUT_SECONDS", "0.01")
+        with patch(
+            "pi_ai.providers.anthropic._build_client",
+            return_value=(client, False),
+        ):
+            events = await _collect_async(
+                anthropic_provider.stream_simple(
+                    _make_model(provider="minimax"),
+                    _make_context(),
+                    SimpleStreamOptions(
+                        api_key="test-key", on_response=on_response
+                    ),
+                )
+            )
+
+        assert events[-1].type == "error"
+        assert len(calls) == 1
+        assert len(responses) == 1
+        assert responses[0]["events"] == [raw_event]
+        assert responses[0]["idle_retries"] == 0
+
+    @pytest.mark.asyncio
+    async def test_minimax_stops_after_one_retry_when_both_streams_are_idle(
+        self, monkeypatch
+    ):
+        from pi_ai.providers import anthropic as anthropic_provider
+        from pi_ai.types import SimpleStreamOptions
+
+        class IdleStream:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.Event().wait()
+
+            async def get_final_message(self):
+                raise AssertionError("an idle stream has no final message")
+
+        streams = [IdleStream(), IdleStream()]
+        calls = []
+
+        def open_stream(**_kwargs):
+            calls.append(1)
+            return self.FakeStreamContext(streams.pop(0))
+
+        client = SimpleNamespace(messages=SimpleNamespace(stream=open_stream))
+        responses = []
+
+        async def on_response(response, _model):
+            responses.append(response)
+
+        monkeypatch.setenv("TAU_PROVIDER_STREAM_IDLE_TIMEOUT_SECONDS", "0.01")
+        with patch(
+            "pi_ai.providers.anthropic._build_client",
+            return_value=(client, False),
+        ):
+            events = await asyncio.wait_for(
+                _collect_async(
+                    anthropic_provider.stream_simple(
+                        _make_model(provider="minimax"),
+                        _make_context(),
+                        SimpleStreamOptions(
+                            api_key="test-key", on_response=on_response
+                        ),
+                    )
+                ),
+                timeout=0.5,
+            )
+
+        assert events[-1].type == "error"
+        assert "remained idle" in events[-1].error.error_message
+        assert len(calls) == 2
+        assert len(responses) == 1
+        assert responses[0]["events"] == []
+        assert responses[0]["final_message"] is None
+        assert responses[0]["idle_retries"] == 1
 
 
 # ---------------------------------------------------------------------------
