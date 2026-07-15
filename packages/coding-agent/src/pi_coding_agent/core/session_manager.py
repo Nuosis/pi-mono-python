@@ -376,6 +376,8 @@ class SessionManager:
         except OSError:
             pass
 
+        self._leaf_id = self._entries[-1].get("id") if self._entries else None
+
         # Run migrations if needed
         all_entries = ([self._header] if self._header else []) + self._entries
         if migrate_to_current_version(all_entries):

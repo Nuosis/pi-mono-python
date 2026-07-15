@@ -68,6 +68,25 @@ def test_multiple_messages(session_manager):
         assert msg["content"] == f"Message {i}"
 
 
+def test_open_restores_current_leaf_and_message_context(session_dir):
+    original = SessionManager.create(cwd=session_dir, session_dir=session_dir)
+    first_id = original.append_message(
+        {"role": "user", "content": "first", "timestamp": 1}
+    )
+    last_id = original.append_message(
+        {"role": "assistant", "content": [{"type": "text", "text": "second"}], "timestamp": 2}
+    )
+
+    reopened = SessionManager.open(original.get_session_file())
+
+    assert first_id != last_id
+    assert reopened.get_leaf_id() == last_id
+    assert [message["role"] for message in reopened.get_messages()] == [
+        "user",
+        "assistant",
+    ]
+
+
 def test_model_change(session_manager):
     session_manager.append_model_change("anthropic", "claude-3-5-sonnet-20241022")
 
