@@ -118,7 +118,12 @@ async def _post(name: str, input: Any, output: Any, metadata: dict[str, Any]) ->
                 resp.text[:300],
             )
     except Exception as exc:  # noqa: BLE001 — telemetry must never break the agent
-        logger.warning("tau.instrumentation emit failed name=%s err=%s", name, exc)
+        logger.warning(
+            "tau.instrumentation emit failed name=%s exception_type=%s exception_repr=%r",
+            name,
+            type(exc).__name__,
+            exc,
+        )
 
 
 def emit(
