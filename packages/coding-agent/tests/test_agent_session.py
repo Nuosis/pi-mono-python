@@ -23,6 +23,7 @@ from pi_ai.types import (
 )
 from pi_ai import get_model
 from pi_coding_agent.core.agent_session import AgentSession
+from pi_coding_agent.core.extensions.types import Extension
 from pi_coding_agent.core.session_manager import SessionManager
 from pi_coding_agent.core.settings_manager import Settings
 from pi_agent import AgentOptions
@@ -120,6 +121,74 @@ async def test_agent_session_subscribe_events(agent_session):
     event_types = [e.type for e in events]
     assert "agent_start" in event_types
     assert "agent_end" in event_types
+
+
+@pytest.mark.asyncio
+async def test_turn_end_extension_can_continue_same_agent_loop(agent_session):
+    calls = 0
+
+    async def two_response_stream(model, context, opts=None):
+        nonlocal calls
+        calls += 1
+        text = "premature" if calls == 1 else "completed after guard"
+        partial = AssistantMessage(
+            role="assistant", content=[], api=model.api, provider=model.provider,
+            model=model.id, usage=Usage(), stop_reason="stop", timestamp=_ts(),
+        )
+        yield EventStart(type="start", partial=partial)
+        with_text = partial.model_copy(update={"content": [TextContent(type="text", text="")]})
+        yield EventTextStart(type="text_start", content_index=0, partial=with_text)
+        final = partial.model_copy(update={
+            "content": [TextContent(type="text", text=text)],
+            "stop_reason": "stop",
+        })
+        yield EventTextEnd(type="text_end", content_index=0, content=text, partial=final)
+        yield EventDone(type="done", reason="stop", message=final)
+
+    continued = False
+    handler_errors = []
+    streaming_states = []
+    queued_states = []
+
+    async def on_turn_end(event, ctx):
+        nonlocal continued
+        if continued:
+            return
+        continued = True
+        streaming_states.append(agent_session.is_streaming)
+        try:
+            await ctx.sendUserMessage(
+                "[workflow guard] Required workflow step is missing; continue before answering.",
+                {"deliverAs": "followUp"},
+            )
+            queued_states.append(agent_session._agent.has_queued_messages())
+        except Exception as exc:
+            handler_errors.append(exc)
+            raise
+
+    agent_session.extension_runner.extensions.append(Extension(
+        path="turn-guard",
+        resolved_path="turn-guard",
+        handlers={"turn_end": [on_turn_end]},
+    ))
+    agent_session._agent.stream_fn = two_response_stream
+
+    await agent_session.prompt("continue guarded workflow")
+
+    assert continued
+    assert not handler_errors
+    assert streaming_states == [True]
+    assert queued_states == [True]
+    assert not agent_session._agent.has_queued_messages()
+    assert calls == 2
+    assistant_texts = [
+        block.text
+        for message in agent_session.state.messages
+        if getattr(message, "role", "") == "assistant"
+        for block in getattr(message, "content", [])
+        if isinstance(block, TextContent)
+    ]
+    assert assistant_texts == ["premature", "completed after guard"]
 
 
 @pytest.mark.asyncio

@@ -249,6 +249,14 @@ class AgentEndEvent:
 
 
 @dataclass
+class TurnEndEvent:
+    """Fired inside the agent loop before it may finish the request."""
+    type: str = "turn_end"
+    message: Any = None
+    tool_results: list[Any] = field(default_factory=list)
+
+
+@dataclass
 class ResourcesDiscoverEvent:
     type: str = "resources_discover"
 
