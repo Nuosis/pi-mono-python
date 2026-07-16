@@ -657,3 +657,51 @@ async def test_tau_startup_restores_explicit_agent_runtime_directories_before_ex
 
     session_files = list(sessions_dir.glob("*.jsonl"))
     assert bool(session_files) is not no_session
+
+
+@pytest.mark.asyncio
+async def test_tau_startup_uses_explicit_session_dir_with_read_only_agent_definition(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Charlie-style read-only agent sources keep runtime state out-of-tree."""
+    from pi_coding_agent import main as main_mod
+
+    home = tmp_path / "home"
+    agent_root = tmp_path / "charlie" / "ea"
+    config_dir = agent_root / ".tau"
+    external_sessions = tmp_path / "runtime" / "sessions"
+    home.mkdir()
+    config_dir.mkdir(parents=True)
+    (config_dir / "settings.json").write_text(
+        json.dumps({"memory_enabled": False}),
+        encoding="utf-8",
+    )
+    config_dir.chmod(0o555)
+
+    monkeypatch.chdir(agent_root)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    monkeypatch.delenv("TAU_CODING_AGENT_DIR", raising=False)
+
+    async def no_piped_stdin() -> None:
+        return None
+
+    monkeypatch.setattr(main_mod, "_read_piped_stdin", no_piped_stdin)
+
+    try:
+        assert await main_mod._run([
+            "--list-models",
+            "--offline",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-context-files",
+            "--session-dir",
+            str(external_sessions),
+        ]) == 0
+    finally:
+        config_dir.chmod(0o755)
+
+    assert external_sessions.is_dir()
+    assert not (config_dir / "agent").exists()

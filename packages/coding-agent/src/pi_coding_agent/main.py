@@ -714,7 +714,10 @@ async def _run(args: Sequence[str]) -> int:
     if not first_pass.version and not first_pass.help and first_pass.kill is None:
         from .config import ensure_agent_runtime_directories
 
-        runtime_paths = ensure_agent_runtime_directories(os.getcwd())
+        runtime_paths = ensure_agent_runtime_directories(
+            os.getcwd(),
+            session_dir=first_pass.session_dir,
+        )
         log_event(
             "agent_runtime_directories_ensured",
             created=[os.path.relpath(path, os.getcwd()) for path in runtime_paths],

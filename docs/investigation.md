@@ -117,3 +117,43 @@ the explicit PI/TAU agent directory first (falling back to `<cwd>/.tau`),
 initializes sessions and memory before extension loading, and routes persistent
 session JSONL files into that active agent's sessions directory. The focused
 Devin-topology regression passes for persistent and `--no-session` launches.
+
+---
+
+## Read-only agent definition with external sessions — 2026-07-16
+
+### Problem
+
+`agent charlie` launches the selected production persona from the read-only
+`/opt/agents` bind mount and supplies a writable external `--session-dir`.
+Tau 0.56.21 nevertheless tries to create `.tau/agent/sessions` below the
+persona source before launch and exits with `PermissionError`.
+
+### Observable success
+
+Tau starts from a read-only agent definition when `--session-dir` points at a
+writable external location, creates that external directory when needed, and
+does not attempt to create `.tau/agent` inside the read-only source tree. The
+literal `agent charlie` EA route must then reach the interactive TUI.
+
+### Hypothesis list
+
+| # | Hypothesis | Null hypothesis | Status |
+|---|------------|-----------------|--------|
+| 1 | The Charlie bind mount is unwritable to the container user | The selected persona's `.tau` directory is writable to `appuser` | FALSIFIED by `test -w` and the read-only mount readback |
+| 2 | The launcher omits an external runtime path | The launcher passes a writable `--session-dir` | FALSIFIED by the literal launcher command and writable-volume readback |
+| 3 | Startup ignores the parsed session override during runtime restoration | Startup routes initial directory creation through `first_pass.session_dir` | FALSIFIED by the deployed traceback and non-interactive reproduction |
+
+### Debug evidence
+
+The deployed container runs as `uid=1000(appuser)`. `/opt/agents` is mounted
+read-only and `/data/project-agents` is mounted read-write. The launcher passes
+`--session-dir /data/project-agents/.charlie-tui-home/sessions`, but the
+traceback shows `ensure_agent_runtime_directories(os.getcwd())` attempting
+`/opt/agents/charlie/ea/.tau/agent/sessions` before the parsed override is used.
+
+### Current hypothesis
+
+Root cause confirmed: startup runtime restoration does not receive the already
+parsed explicit session directory. It must treat that directory as the session
+runtime owner and leave the agent definition tree untouched.

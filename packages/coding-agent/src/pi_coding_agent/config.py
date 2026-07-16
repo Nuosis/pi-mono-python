@@ -380,7 +380,11 @@ def ensure_memory_store(
     return db_path if os.path.exists(db_path) else None
 
 
-def ensure_agent_runtime_directories(cwd: str | None = None) -> list[str]:
+def ensure_agent_runtime_directories(
+    cwd: str | None = None,
+    *,
+    session_dir: str | None = None,
+) -> list[str]:
     """Restore ignored runtime state required by the active Tau agent.
 
     Agent checkouts intentionally omit sessions and the SQLite memory store.
@@ -390,10 +394,17 @@ def ensure_agent_runtime_directories(cwd: str | None = None) -> list[str]:
     base = cwd or os.getcwd()
     config_dir = get_active_config_dir(base)
     agent_dir = os.path.join(config_dir, "agent")
-    sessions_dir = get_active_sessions_dir(base)
+    sessions_dir = (
+        os.path.abspath(os.path.expanduser(session_dir))
+        if session_dir
+        else get_active_sessions_dir(base)
+    )
     created: list[str] = []
 
-    if not os.path.isdir(agent_dir):
+    # An explicit session directory is the runtime owner. The agent definition
+    # may be a read-only bind mount (Charlie production), so do not synthesize
+    # an otherwise-unused agent directory beside its source files.
+    if not session_dir and not os.path.isdir(agent_dir):
         os.makedirs(agent_dir, mode=0o700, exist_ok=True)
         created.append(agent_dir)
     if not os.path.isdir(sessions_dir):
