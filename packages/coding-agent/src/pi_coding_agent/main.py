@@ -707,6 +707,18 @@ async def _run(args: Sequence[str]) -> int:
     )
 
     first_pass = parse_args(list(args))
+    # Runtime state is intentionally omitted from agent repositories. Restore
+    # the active agent's complete layout before extensions are loaded. An
+    # explicit agent-dir env may point somewhere other than the subprocess cwd
+    # (Devin subagents use exactly that topology).
+    if not first_pass.version and not first_pass.help and first_pass.kill is None:
+        from .config import ensure_agent_runtime_directories
+
+        runtime_paths = ensure_agent_runtime_directories(os.getcwd())
+        log_event(
+            "agent_runtime_directories_ensured",
+            created=[os.path.relpath(path, os.getcwd()) for path in runtime_paths],
+        )
     event_bus = create_event_bus()
     ext_paths = first_pass.extensions or []
     if not first_pass.no_extensions:
@@ -823,11 +835,12 @@ async def _run(args: Sequence[str]) -> int:
                 print(f"  + {os.path.relpath(path, cwd)}", file=sys.stderr)
         else:
             print(".tau project already initialized.", file=sys.stderr)
-    # Sessions are contained per-project by default (unless --session-dir given).
+    # Sessions belong to the active agent by default (unless --session-dir is
+    # given), even when an explicit agent definition runs against another cwd.
     if not parsed.session_dir and not parsed.no_session:
-        from .config import get_project_sessions_dir
+        from .config import get_active_sessions_dir
 
-        parsed.session_dir = get_project_sessions_dir(cwd)
+        parsed.session_dir = get_active_sessions_dir(cwd)
         log_event("session_dir_defaulted", session_dir=parsed.session_dir)
     # Every launch (not just --init) leaves a populated, visible project config
     # so a normal `tau` run never produces a half-empty .tau (sessions dir
