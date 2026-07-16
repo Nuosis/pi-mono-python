@@ -93,7 +93,7 @@ async def mock_stream_simple_fn(model, context, options=None):
     yield EventDone(type="done", reason="stop", message=final)
 
 
-def test_compress_context_preserves_prompts_and_read_results():
+def test_compress_context_preserves_prompts_and_retrieval_results():
     import pi_ai
     from pi_ai.compression import compress_context
 
@@ -103,6 +103,7 @@ def test_compress_context_preserves_prompts_and_read_results():
             messages=[
                 make_user_message("live prompt"),
                 make_tool_result("read", "fresh file content"),
+                make_tool_result("ccr_retrieve", "full persisted CCR content"),
                 make_tool_result("bash", "large command output"),
             ]
         )
@@ -111,7 +112,8 @@ def test_compress_context_preserves_prompts_and_read_results():
 
         assert out.messages[0].content == "live prompt"
         assert out.messages[1].content[0].text == "fresh file content"
-        assert out.messages[2].content[0].text.startswith("<<C>>")
+        assert out.messages[2].content[0].text == "full persisted CCR content"
+        assert out.messages[3].content[0].text.startswith("<<C>>")
     finally:
         pi_ai.unregister_compressor()
 

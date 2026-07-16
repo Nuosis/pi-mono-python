@@ -24,7 +24,7 @@ CompressFn = Callable[[str], str]
 # Match Headroom's fresh-read guardrail: file/source inspection outputs are the
 # current working context, not stale log blobs. Compressing them can hide the
 # actual task/source anchor and force the model into broad CCR query fishing.
-EXCLUDED_TOOL_NAMES = frozenset({"read", "Read"})
+EXCLUDED_TOOL_NAMES = frozenset({"read", "Read", "ccr_retrieve"})
 
 _compressor: Optional[CompressFn] = None
 
