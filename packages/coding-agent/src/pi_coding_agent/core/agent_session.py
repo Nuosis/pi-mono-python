@@ -560,20 +560,21 @@ class AgentSession:
         return key
 
     async def _on_provider_payload(self, payload: Any, model: Model | None = None) -> Any:
+        final_payload = payload
+        if self._extension_runner.has_handlers("before_provider_request"):
+            final_payload = await self._extension_runner.emit_before_provider_request(payload)
         # Instrumentation: the exact request handed to the provider — system
         # prompt, message history, and tools — the definitive record of what the
         # brain received on this turn.
         try:
             _instr_emit(
                 "tau.provider_request",
-                input=payload,
+                input=final_payload,
                 metadata={"phase": "provider_request", "model": getattr(model, "id", None)},
             )
         except Exception:  # noqa: BLE001
             pass
-        if not self._extension_runner.has_handlers("before_provider_request"):
-            return payload
-        return await self._extension_runner.emit_before_provider_request(payload)
+        return final_payload
 
     async def _on_provider_response(self, response: Any, model: Model | None = None) -> None:
         try:
