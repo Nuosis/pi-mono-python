@@ -419,6 +419,81 @@ class TestOpenAIResponsesParams:
 
         assert "max_output_tokens" not in body
 
+    @pytest.mark.asyncio
+    async def test_openai_completions_on_payload_mutation_reaches_sdk_request(self):
+        from pi_ai.providers.openai_completions import stream_simple
+        from pi_ai.types import Context, SimpleStreamOptions, Tool
+
+        class EmptyStream:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+        create = AsyncMock(return_value=EmptyStream())
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        async def restrict_tools(payload, model):
+            assert model.id == "MiniMax-M3"
+            return {
+                **payload,
+                "tools": [payload["tools"][1]],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "sms.notify_staff_owner"},
+                },
+                "parallel_tool_calls": False,
+            }
+
+        tools = [
+            Tool(
+                name=name,
+                description=name,
+                parameters={"type": "object", "properties": {}},
+            )
+            for name in ("people_ops.calendar_check", "sms.notify_staff_owner")
+        ]
+
+        with patch(
+            "pi_ai.providers.openai_completions._openai.AsyncOpenAI",
+            return_value=client,
+        ):
+            events = [
+                event
+                async for event in stream_simple(
+                    _make_model(
+                        id_="MiniMax-M3",
+                        provider="minimax",
+                        api="openai-completions",
+                    ),
+                    Context(tools=tools),
+                    SimpleStreamOptions(
+                        api_key="test-key",
+                        on_payload=restrict_tools,
+                    ),
+                )
+            ]
+
+        assert events[0].type == "start"
+        request = create.await_args.kwargs
+        assert [item["function"]["name"] for item in request["tools"]] == [
+            "sms.notify_staff_owner"
+        ]
+        assert request["tool_choice"] == {
+            "type": "function",
+            "function": {"name": "sms.notify_staff_owner"},
+        }
+        assert request["parallel_tool_calls"] is False
+
     def test_openai_codex_responses_body_always_sends_instructions(self):
         from pi_ai import Context
         from pi_ai.providers.openai_codex_responses import _build_request_body
