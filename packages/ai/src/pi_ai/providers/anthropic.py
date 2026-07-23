@@ -521,7 +521,26 @@ async def stream_simple(
 
     try:
         async with client.messages.stream(**params) as ant_stream:
-            async for event in ant_stream:
+            # The Anthropic SDK accumulates usage while yielding each event via
+            # __anext__ (accumulate_event runs *inside* the iterator, before the
+            # event is handed to us). A model served over the anthropic-messages
+            # API — e.g. MiniMax-M3 — can emit a `message_delta` whose `usage` is
+            # null, which the SDK dereferences unconditionally
+            # (`current_snapshot.usage.output_tokens = event.usage.output_tokens`)
+            # and raises AttributeError from within iteration. That must not abort
+            # the turn. Iterate manually so an accumulation AttributeError is
+            # caught here, finalizing the stream gracefully with the usage already
+            # accumulated in `partial` (mirroring the get_final_message() fallback
+            # below). Any other exception still propagates to the outer handler so
+            # genuine stream/transport errors keep their existing error semantics.
+            stream_iter = ant_stream.__aiter__()
+            while True:
+                try:
+                    event = await stream_iter.__anext__()
+                except StopAsyncIteration:
+                    break
+                except AttributeError:
+                    break
                 # Preserve the provider-native event before any Tau parsing or
                 # normalization can discard information needed for diagnosis.
                 raw_response_events.append(event)

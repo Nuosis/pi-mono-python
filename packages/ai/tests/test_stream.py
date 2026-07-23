@@ -232,3 +232,154 @@ async def test_stream_unknown_api_raises():
     with pytest.raises(ValueError, match="No stream function"):
         async for _ in stream_simple(model, context):
             pass
+
+
+# ── Regression: MiniMax-style message_delta with usage=None must not crash ──────
+#
+# MiniMax-M3 is served over the anthropic-messages API, so its streamed response
+# flows through pi_ai.providers.anthropic. It emits a `message_delta` whose
+# `usage` is null. The official Anthropic SDK accumulates usage *inside* the
+# stream iterator (accumulate_event runs during __anext__, before the event is
+# handed to us) and dereferences usage unconditionally:
+#   current_snapshot.usage.output_tokens = event.usage.output_tokens
+# raising `AttributeError: 'NoneType' object has no attribute 'output_tokens'`.
+# Before the guard this killed the turn with stop_reason="error". The provider
+# must tolerate it and finalize with the usage already accumulated in `partial`.
+#
+# This test drives the REAL SDK accumulator via a faithful fake stream, so it
+# reproduces the exact crash path rather than merely simulating it.
+
+
+def _minimax_none_usage_events():
+    """Raw SDK events ending in a message_delta whose usage is None."""
+    import anthropic.types as T
+    from anthropic.types.raw_message_start_event import RawMessageStartEvent
+    from anthropic.types.raw_content_block_start_event import RawContentBlockStartEvent
+    from anthropic.types.raw_content_block_delta_event import RawContentBlockDeltaEvent
+    from anthropic.types.raw_content_block_stop_event import RawContentBlockStopEvent
+    from anthropic.types.raw_message_delta_event import RawMessageDeltaEvent, Delta
+    from anthropic.types.text_delta import TextDelta
+
+    msg = T.Message.model_construct(
+        id="m1", type="message", role="assistant", model="MiniMax-M3",
+        content=[], stop_reason=None, stop_sequence=None,
+        usage=T.Usage(input_tokens=10, output_tokens=0),
+    )
+    text_block = T.TextBlock.model_construct(type="text", text="", citations=None)
+    return [
+        RawMessageStartEvent.model_construct(type="message_start", message=msg),
+        RawContentBlockStartEvent.model_construct(
+            type="content_block_start", index=0, content_block=text_block),
+        RawContentBlockDeltaEvent.model_construct(
+            type="content_block_delta", index=0,
+            delta=TextDelta.model_construct(type="text_delta", text="hi")),
+        RawContentBlockStopEvent.model_construct(type="content_block_stop", index=0),
+        # The offending event: message_delta with usage=None.
+        RawMessageDeltaEvent.model_construct(
+            type="message_delta",
+            delta=Delta.model_construct(stop_reason="end_turn", stop_sequence=None),
+            usage=None),
+    ]
+
+
+class _FakeAntStream:
+    """Mimics anthropic's MessageStream: accumulates via the real SDK function
+    while yielding each event through __anext__, exactly as the SDK does."""
+
+    def __init__(self, events):
+        self._events = list(events)
+        self._i = 0
+        self._snapshot = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        from anthropic.lib.streaming._messages import accumulate_event
+        if self._i >= len(self._events):
+            raise StopAsyncIteration
+        event = self._events[self._i]
+        self._i += 1
+        # Real SDK accumulation — raises AttributeError on the None-usage delta.
+        self._snapshot = accumulate_event(event=event, current_snapshot=self._snapshot)
+        return event
+
+    async def get_final_message(self):
+        return self._snapshot
+
+
+class _FakeAntClient:
+    def __init__(self, events):
+        stream = _FakeAntStream
+
+        class _Messages:
+            def stream(self_inner, **params):
+                return stream(events)
+
+        self.messages = _Messages()
+
+
+def test_accumulate_event_none_usage_reproduces_sdk_crash():
+    """Guard the guard: the chosen event genuinely crashes the real SDK
+    accumulator, so the provider test below exercises the real failure path."""
+    from anthropic.lib.streaming._messages import accumulate_event
+
+    snapshot = None
+    crashed = False
+    for event in _minimax_none_usage_events():
+        try:
+            snapshot = accumulate_event(event=event, current_snapshot=snapshot)
+        except AttributeError as exc:
+            crashed = True
+            assert "output_tokens" in str(exc)
+    assert crashed, "expected the None-usage message_delta to crash the SDK accumulator"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_stream_survives_none_usage_message_delta():
+    from pi_ai.types import Model, ModelCost
+    from pi_ai.providers.anthropic import stream_simple as anthropic_stream_simple
+
+    model = Model(
+        id="MiniMax-M3",
+        name="MiniMax M3",
+        api="anthropic-messages",
+        provider="minimax",
+        base_url="https://api.example/anthropic",
+        cost=ModelCost(),
+        context_window=4096,
+        max_tokens=1024,
+    )
+    context = make_context("hi")
+
+    events = []
+    with patch(
+        "pi_ai.providers.anthropic._build_client",
+        return_value=(_FakeAntClient(_minimax_none_usage_events()), False),
+    ):
+        async for ev in anthropic_stream_simple(model, context):
+            events.append(ev)
+
+    # The turn must NOT die: the terminal event is a normal completion, not an
+    # error carrying the SDK's 'NoneType'...'output_tokens' message.
+    terminal = events[-1]
+    assert isinstance(terminal, EventDone), (
+        f"expected EventDone, got {type(terminal).__name__}: "
+        f"{getattr(getattr(terminal, 'error', None), 'error_message', None)}"
+    )
+    assert terminal.reason == "stop"
+
+    final = terminal.message
+    assert final.stop_reason == "stop"
+    assert final.error_message is None
+    # Usage falls back to what was accumulated before the null-usage delta.
+    assert final.usage.input == 10
+    assert final.usage.output == 0
+    # Streamed text still made it through.
+    assert any(isinstance(e, EventTextDelta) for e in events)
