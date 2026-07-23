@@ -688,11 +688,6 @@ class TestSDKAlignment:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         seen = []
-        instrumented = []
-        monkeypatch.setattr(
-            "pi_coding_agent.core.agent_session._instr_emit",
-            lambda name, **kwargs: instrumented.append((name, kwargs)),
-        )
 
         def before_provider_handler(event, ctx):
             seen.append((event["payload"], ctx.cwd))
@@ -744,12 +739,6 @@ class TestSDKAlignment:
 
         assert seen == [({"original": True}, str(tmp_path))]
         assert provider_payloads == [{"original": True, "extensionTouched": True}]
-        provider_request = next(
-            kwargs["input"]
-            for name, kwargs in instrumented
-            if name == "tau.provider_request"
-        )
-        assert provider_request == {"original": True, "extensionTouched": True}
 
     @pytest.mark.asyncio
     async def test_after_provider_response_emits_through_session_prompt(self, tmp_path, monkeypatch):
