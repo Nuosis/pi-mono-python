@@ -159,6 +159,44 @@ class TestOpenAIResponsesShared:
         assert result[0]["call_id"] == "call_123"
         assert result[0]["id"] == "fc_item_456"
 
+    def test_convert_responses_messages_uses_provider_safe_tool_name(self):
+        from pi_ai.providers.openai_responses_shared import convert_responses_messages
+        from pi_ai.types import AssistantMessage, Context, Model, ModelCost, ToolCall
+
+        model = Model(
+            id="target",
+            name="Target",
+            api="openai-responses",
+            provider="openai",
+            base_url="https://api.openai.com/v1",
+            cost=ModelCost(),
+            context_window=128000,
+            max_tokens=4096,
+        )
+        source = AssistantMessage(
+            content=[
+                ToolCall(
+                    id="call_123|fc_item_456",
+                    name="sms.send_booking_link_to_caller",
+                    arguments={"lead_qualified": True},
+                )
+            ],
+            api="openai-responses",
+            provider="openai",
+            model="target",
+            timestamp=1,
+        )
+
+        result = convert_responses_messages(
+            model,
+            Context(messages=[source]),
+            tool_name_map={
+                "sms.send_booking_link_to_caller": "sms_send_booking_link_abc123",
+            },
+        )
+
+        assert result[0]["name"] == "sms_send_booking_link_abc123"
+
     def test_convert_responses_tools(self):
         from pi_ai.providers.openai_responses_shared import convert_responses_tools
         tool = MagicMock()
@@ -178,6 +216,21 @@ class TestOpenAIResponsesShared:
         tool.parameters = {}
         result = convert_responses_tools([tool], strict=True)
         assert result[0]["strict"] is True
+
+    def test_provider_safe_tool_names_do_not_collide_with_existing_name(self):
+        from pi_ai.providers.openai_responses_shared import (
+            build_responses_tool_name_map,
+            provider_safe_tool_name,
+        )
+
+        dotted = MagicMock(name="dotted")
+        dotted.name = "sms.send"
+        already_safe = MagicMock(name="already_safe")
+        already_safe.name = provider_safe_tool_name(dotted.name)
+
+        mapping = build_responses_tool_name_map([dotted, already_safe])
+
+        assert len(set(mapping.values())) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +653,63 @@ class TestOpenAIResponsesParams:
         assert envelope["events"] == raw_events
         assert envelope["final_response"] == raw_events[-1]["response"]
         assert callback_model.id == "gpt-5.5"
+
+    @pytest.mark.asyncio
+    async def test_openai_responses_round_trips_dotted_tool_name(self):
+        from pi_ai.providers.openai_responses import stream_openai_responses
+        from pi_ai.types import Context, Tool
+
+        async def tool_events(provider_tool_name):
+            item = {
+                "type": "function_call",
+                "id": "fc_item_1",
+                "call_id": "call_1",
+                "name": provider_tool_name,
+                "arguments": '{"lead_qualified":true,"lead_accepted_sms":true}',
+            }
+            yield {"type": "response.output_item.added", "item": item}
+            yield {
+                "type": "response.function_call_arguments.done",
+                "arguments": item["arguments"],
+            }
+            yield {"type": "response.output_item.done", "item": item}
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 7,
+                        "output_tokens": 3,
+                        "total_tokens": 10,
+                        "input_tokens_details": {"cached_tokens": 0},
+                    },
+                },
+            }
+
+        async def create(**request):
+            provider_tool_name = request["tools"][0]["name"]
+            assert "." not in provider_tool_name
+            return tool_events(provider_tool_name)
+
+        responses = SimpleNamespace(create=AsyncMock(side_effect=create))
+        client = SimpleNamespace(responses=responses)
+        tool = Tool(
+            name="sms.send_booking_link_to_caller",
+            description="Send a booking link",
+            parameters={"type": "object", "properties": {}},
+        )
+
+        with patch("openai.AsyncOpenAI", return_value=client):
+            stream = stream_openai_responses(
+                _make_model(id_="gpt-5.4-mini", provider="openai", api="openai-responses"),
+                Context(tools=[tool]),
+                {"api_key": "test-key"},
+            )
+            events = [event async for event in stream]
+
+        assert events[-1]["type"] == "done"
+        result = await stream.result()
+        assert result.content[0].name == "sms.send_booking_link_to_caller"
 
     @pytest.mark.asyncio
     async def test_openai_responses_emits_partial_raw_response_when_stream_fails(self):

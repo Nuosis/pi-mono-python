@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 from pi_ai.models import calculate_cost, supports_xhigh
 from pi_ai.providers.github_copilot_headers import build_copilot_dynamic_headers, has_copilot_vision_input
 from pi_ai.providers.openai_responses_shared import (
+    build_responses_tool_name_map,
     convert_responses_messages,
     convert_responses_tools,
     process_responses_stream,
@@ -96,7 +97,19 @@ def stream_openai_responses(
         try:
             api_key = opts.get("api_key") or get_env_api_key(model.provider) or ""
             client = _create_client(model, context, api_key, opts.get("headers"))
-            params = _build_params(model, context, opts)
+            internal_tool_name_map = build_responses_tool_name_map(
+                list(getattr(context, "tools", None) or [])
+            )
+            provider_tool_name_map = {
+                provider_name: internal_name
+                for internal_name, provider_name in internal_tool_name_map.items()
+            }
+            params = _build_params(
+                model,
+                context,
+                opts,
+                tool_name_map=internal_tool_name_map,
+            )
 
             params = await apply_on_payload(params, model, opts.get("on_payload"))
 
@@ -113,6 +126,7 @@ def stream_openai_responses(
                 model,
                 service_tier=opts.get("service_tier"),
                 apply_service_tier_pricing=_apply_service_tier_pricing,
+                tool_name_map=provider_tool_name_map,
             )
             await notify_response()
 
@@ -202,8 +216,15 @@ def _build_params(
     model: "Model",
     context: "Context",
     opts: dict[str, Any],
+    *,
+    tool_name_map: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    messages = convert_responses_messages(model, context, _OPENAI_TOOL_CALL_PROVIDERS)
+    messages = convert_responses_messages(
+        model,
+        context,
+        _OPENAI_TOOL_CALL_PROVIDERS,
+        tool_name_map=tool_name_map,
+    )
     params: dict[str, Any] = {
         "model": model.id,
         "input": messages,
@@ -220,7 +241,10 @@ def _build_params(
 
     tools = getattr(context, "tools", None)
     if tools:
-        params["tools"] = convert_responses_tools(tools)
+        params["tools"] = convert_responses_tools(
+            tools,
+            tool_name_map=tool_name_map,
+        )
 
     service_tier = opts.get("service_tier")
     if service_tier:

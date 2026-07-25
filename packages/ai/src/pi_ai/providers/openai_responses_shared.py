@@ -10,6 +10,7 @@ Mirrors openai-responses-shared.ts
 from __future__ import annotations
 
 import json
+import re
 from typing import TYPE_CHECKING, Any
 
 from pi_ai.utils.json_parse import parse_streaming_json
@@ -47,6 +48,38 @@ def _short_hash(s: str) -> str:
     return format(h2 & 0xFFFFFFFF, "x") + format(h1 & 0xFFFFFFFF, "x")
 
 
+_OPENAI_TOOL_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+_OPENAI_TOOL_NAME_MAX_LENGTH = 64
+
+
+def provider_safe_tool_name(name: str) -> str:
+    """Encode an internal tool name for OpenAI without losing the local name."""
+    if (
+        len(name) <= _OPENAI_TOOL_NAME_MAX_LENGTH
+        and _OPENAI_TOOL_NAME_PATTERN.fullmatch(name)
+    ):
+        return name
+    stem = re.sub(r"[^a-zA-Z0-9_-]", "_", name).strip("_") or "tool"
+    suffix = _short_hash(name)[:12]
+    stem_limit = _OPENAI_TOOL_NAME_MAX_LENGTH - len(suffix) - 1
+    return f"{stem[:stem_limit]}_{suffix}"
+
+
+def build_responses_tool_name_map(tools: "list[Tool]") -> dict[str, str]:
+    """Map internal tool names to collision-resistant provider-safe names."""
+    mapping: dict[str, str] = {}
+    used_provider_names: set[str] = set()
+    for tool in tools:
+        candidate = provider_safe_tool_name(tool.name)
+        collision_index = 1
+        while candidate in used_provider_names:
+            candidate = provider_safe_tool_name(f"{tool.name}#{collision_index}")
+            collision_index += 1
+        mapping[tool.name] = candidate
+        used_provider_names.add(candidate)
+    return mapping
+
+
 # ---------------------------------------------------------------------------
 # Message conversion
 # ---------------------------------------------------------------------------
@@ -60,6 +93,7 @@ def convert_responses_messages(
     context: "Context",
     allowed_tool_call_providers: frozenset[str] | None = None,
     include_system_prompt: bool = True,
+    tool_name_map: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Convert internal messages to OpenAI Responses API input format."""
     from pi_ai.providers.transform_messages import transform_messages
@@ -165,7 +199,7 @@ def convert_responses_messages(
                     fc: dict[str, Any] = {
                         "type": "function_call",
                         "call_id": call_id,
-                        "name": block.name,
+                        "name": (tool_name_map or {}).get(block.name, block.name),
                         "arguments": json.dumps(getattr(block, "arguments", {}) or {}),
                     }
                     if item_id is not None:
@@ -213,12 +247,13 @@ def convert_responses_messages(
 def convert_responses_tools(
     tools: "list[Tool]",
     strict: bool | None = False,
+    tool_name_map: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Convert tools to OpenAI Responses API function format."""
     return [
         {
             "type": "function",
-            "name": t.name,
+            "name": (tool_name_map or {}).get(t.name, t.name),
             "description": t.description,
             "parameters": t.parameters,
             "strict": strict if strict is not None else False,
@@ -238,6 +273,7 @@ async def process_responses_stream(
     model: "Model",
     service_tier: str | None = None,
     apply_service_tier_pricing: Any | None = None,
+    tool_name_map: dict[str, str] | None = None,
 ) -> None:
     """Process an OpenAI Responses API stream into our event stream format."""
     from pi_ai.models import calculate_cost
@@ -274,11 +310,15 @@ async def process_responses_stream(
                 item_dict = item if isinstance(item, dict) else item.__dict__
                 call_id = item_dict.get("call_id", "")
                 item_id = item_dict.get("id", "")
+                tool_name = (tool_name_map or {}).get(
+                    item_dict.get("name", ""),
+                    item_dict.get("name", ""),
+                )
                 current_item = item_dict
                 current_partial_json = item_dict.get("arguments", "")
                 current_block = ToolCall(
                     id=f"{call_id}|{item_id}",
-                    name=item_dict.get("name", ""),
+                    name=tool_name,
                     arguments={},
                     arguments_raw=current_partial_json,
                 )
@@ -351,12 +391,16 @@ async def process_responses_stream(
             elif item_type == "function_call":
                 args_raw = current_partial_json or item_dict.get("arguments", "{}")
                 args = parse_streaming_json(args_raw)
+                tool_name = (tool_name_map or {}).get(
+                    item_dict.get("name", ""),
+                    item_dict.get("name", ""),
+                )
                 if getattr(current_block, "type", None) == "toolCall":
                     current_block.arguments_raw = args_raw
                     current_block.arguments = args
                 tool_call = ToolCall(
                     id=f"{item_dict.get('call_id', '')}|{item_dict.get('id', '')}",
-                    name=item_dict.get("name", ""),
+                    name=tool_name,
                     arguments=args,
                     arguments_raw=args_raw,
                 )
