@@ -602,3 +602,59 @@ class TestSessionProperties:
         # Should return the text of the last assistant message
         assert result is not None
         assert len(result) > 0
+
+
+@pytest.mark.asyncio
+async def test_prepare_next_turn_flushes_native_trace_when_durable_mode_enabled(
+    monkeypatch,
+):
+    flushed: list[float] = []
+
+    async def fake_flush(*, timeout_seconds: float) -> None:
+        flushed.append(timeout_seconds)
+
+    class NoExtensions:
+        @staticmethod
+        def has_handlers(_name: str) -> bool:
+            return False
+
+    session = object.__new__(AgentSession)
+    session._extension_runner = NoExtensions()
+    monkeypatch.setenv("TAU_INSTRUMENTATION_FLUSH_ON_TURN", "1")
+    monkeypatch.setenv("TAU_INSTRUMENTATION_FLUSH_TIMEOUT_SECONDS", "7.5")
+    monkeypatch.setattr(
+        "pi_coding_agent.core.agent_session._instr_flush",
+        fake_flush,
+    )
+
+    await session._prepare_next_turn({})
+
+    assert flushed == [7.5]
+
+
+@pytest.mark.asyncio
+async def test_prepare_next_turn_does_not_flush_native_trace_by_default(
+    monkeypatch,
+):
+    flushed = False
+
+    async def fake_flush(*, timeout_seconds: float) -> None:
+        nonlocal flushed
+        flushed = True
+
+    class NoExtensions:
+        @staticmethod
+        def has_handlers(_name: str) -> bool:
+            return False
+
+    session = object.__new__(AgentSession)
+    session._extension_runner = NoExtensions()
+    monkeypatch.delenv("TAU_INSTRUMENTATION_FLUSH_ON_TURN", raising=False)
+    monkeypatch.setattr(
+        "pi_coding_agent.core.agent_session._instr_flush",
+        fake_flush,
+    )
+
+    await session._prepare_next_turn({})
+
+    assert flushed is False

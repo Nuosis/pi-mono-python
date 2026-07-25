@@ -9,8 +9,9 @@ clarity-backend forwards to Langfuse. Query them back per session/correlation.
 Design:
 - **Env-gated.** No-op unless a base URL + token are configured. Never a hard
   dependency, never changes agent behaviour.
-- **Fire-and-forget.** Emits are scheduled on the running loop and awaited
-  nowhere; a slow or failing sink can never block or crash the agent turn.
+- **Fire-and-forget by default.** Emits are scheduled on the running loop. An
+  explicit durable-eval mode may flush pending posts at a turn boundary; sink
+  failures still never crash the agent turn.
 - **Safe serialization + size caps.** Arbitrary provider payloads are coerced to
   JSON-able structures and capped so a huge context can't blow the sink.
 
@@ -30,7 +31,9 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _MAX_FIELD_CHARS = 200_000  # keep full system prompts; cap only the absurd
+_RETRY_DELAYS_SECONDS = (0.25, 0.75)
 _seq = itertools.count(1)
+_pending_tasks: set[asyncio.Task[None]] = set()
 
 
 def _config() -> tuple[str, str] | None:
@@ -98,32 +101,44 @@ async def _post(name: str, input: Any, output: Any, metadata: dict[str, Any]) ->
         "metadata": metadata,
         "level": "DEFAULT",
     }
-    try:
-        import httpx
+    import httpx
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                f"{base}/clarify/instrumentation/events",
-                json=body,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
-            )
-        if resp.status_code >= 400:
+    for attempt in range(len(_RETRY_DELAYS_SECONDS) + 1):
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    f"{base}/clarify/instrumentation/events",
+                    json=body,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001 — telemetry must never break the agent
+            if attempt < len(_RETRY_DELAYS_SECONDS):
+                await asyncio.sleep(_RETRY_DELAYS_SECONDS[attempt])
+                continue
             logger.warning(
-                "tau.instrumentation emit rejected name=%s status=%s body=%s",
+                "tau.instrumentation emit failed name=%s exception_type=%s exception_repr=%r",
                 name,
-                resp.status_code,
-                resp.text[:300],
+                type(exc).__name__,
+                exc,
             )
-    except Exception as exc:  # noqa: BLE001 — telemetry must never break the agent
+            return
+        if resp.status_code < 400:
+            return
+        if (
+            resp.status_code == 429 or resp.status_code >= 500
+        ) and attempt < len(_RETRY_DELAYS_SECONDS):
+            await asyncio.sleep(_RETRY_DELAYS_SECONDS[attempt])
+            continue
         logger.warning(
-            "tau.instrumentation emit failed name=%s exception_type=%s exception_repr=%r",
+            "tau.instrumentation emit rejected name=%s status=%s body=%s",
             name,
-            type(exc).__name__,
-            exc,
+            resp.status_code,
+            resp.text[:300],
         )
+        return
 
 
 def emit(
@@ -132,13 +147,13 @@ def emit(
     input: Any = None,
     output: Any = None,
     metadata: dict[str, Any] | None = None,
-) -> None:
-    """Schedule one instrumentation event. Fire-and-forget; never raises.
+) -> asyncio.Task[None] | None:
+    """Schedule one instrumentation event and retain its task; never raises.
 
     ``name`` must be alphanumeric + ``_.:-`` per the Clarity route validator.
     """
     if _config() is None:
-        return
+        return None
     md: dict[str, Any] = {"source": "tau", "seq": next(_seq)}
     sid = _session_id()
     if sid:
@@ -151,13 +166,31 @@ def emit(
         md.update(metadata)
     try:
         loop = asyncio.get_running_loop()
-        loop.create_task(_post(name, input, output, md))
+        task = loop.create_task(_post(name, input, output, md))
+        _pending_tasks.add(task)
+        task.add_done_callback(_pending_tasks.discard)
+        return task
     except RuntimeError:
         # No running loop (rare, e.g. sync init path) — best-effort synchronous.
         try:
             asyncio.run(_post(name, input, output, md))
         except Exception:
             pass
+        return None
 
 
-__all__ = ["emit", "enabled"]
+async def flush(*, timeout_seconds: float = 15.0) -> None:
+    """Wait for already-scheduled trace posts without propagating sink failures."""
+    tasks = tuple(task for task in _pending_tasks if not task.done())
+    if not tasks:
+        return
+    _, pending = await asyncio.wait(tasks, timeout=timeout_seconds)
+    if pending:
+        logger.warning(
+            "tau.instrumentation flush timed out pending=%s timeout_seconds=%s",
+            len(pending),
+            timeout_seconds,
+        )
+
+
+__all__ = ["emit", "enabled", "flush"]

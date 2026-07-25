@@ -33,6 +33,8 @@ from pi_ai.types import AssistantMessage, ImageContent, Model, TextContent, User
 from pi_coding_agent.config import get_share_viewer_url
 
 from .auth_storage import AuthStorage
+from .clarity_instrumentation import emit as _instr_emit
+from .clarity_instrumentation import flush as _instr_flush
 from .compaction import compact_context, should_compact
 
 
@@ -51,7 +53,6 @@ from .model_registry import ModelRegistry
 from .session_manager import SessionManager
 from .settings_manager import Settings, SettingsManager
 from .system_prompt import build_system_prompt
-from .clarity_instrumentation import emit as _instr_emit
 from .tools import (
     create_bash_tool,
     create_edit_tool,
@@ -592,6 +593,21 @@ class AgentSession:
 
     async def _prepare_next_turn(self, turn_context: dict[str, Any]) -> None:
         """Expose the in-loop turn boundary to extensions before final output."""
+        if os.environ.get("TAU_INSTRUMENTATION_FLUSH_ON_TURN", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            raw_timeout = os.environ.get(
+                "TAU_INSTRUMENTATION_FLUSH_TIMEOUT_SECONDS",
+                "15",
+            )
+            try:
+                timeout_seconds = max(0.1, float(raw_timeout))
+            except ValueError:
+                timeout_seconds = 15.0
+            await _instr_flush(timeout_seconds=timeout_seconds)
         if not self._extension_runner.has_handlers("turn_end"):
             return None
         await self._extension_runner.emit({"type": "turn_end", **turn_context})
