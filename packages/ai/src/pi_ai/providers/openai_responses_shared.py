@@ -68,6 +68,12 @@ def _provider_object_dict(value: Any) -> dict[str, Any]:
     return dict(getattr(value, "__dict__", {}) or {})
 
 
+def _reasoning_item_for_input(value: dict[str, Any]) -> dict[str, Any]:
+    """Strip response-only fields before replaying a reasoning item as input."""
+    accepted_fields = ("type", "id", "encrypted_content", "summary")
+    return {field: value[field] for field in accepted_fields if field in value}
+
+
 def provider_safe_tool_name(name: str) -> str:
     """Encode an internal tool name for OpenAI without losing the local name."""
     if (
@@ -184,7 +190,10 @@ def convert_responses_messages(
                     if sig:
                         try:
                             reasoning_item = json.loads(sig)
-                            output.append(reasoning_item)
+                            if isinstance(reasoning_item, dict):
+                                output.append(
+                                    _reasoning_item_for_input(reasoning_item)
+                                )
                         except (json.JSONDecodeError, TypeError):
                             pass
                 elif block_type == "text":

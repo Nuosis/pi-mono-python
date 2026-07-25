@@ -198,6 +198,69 @@ class TestOpenAIResponsesShared:
 
         assert result[0]["name"] == "sms_send_booking_link_abc123"
 
+    def test_convert_responses_messages_strips_reasoning_response_status(self):
+        from pi_ai.providers.openai_responses_shared import convert_responses_messages
+        from pi_ai.types import (
+            AssistantMessage,
+            Context,
+            Model,
+            ModelCost,
+            ThinkingContent,
+        )
+
+        model = Model(
+            id="gpt-5.4-mini",
+            name="GPT-5.4 mini",
+            api="openai-responses",
+            provider="openai",
+            base_url="https://api.openai.com/v1",
+            reasoning=True,
+            cost=ModelCost(),
+            context_window=128000,
+            max_tokens=4096,
+        )
+        source = AssistantMessage(
+            content=[
+                ThinkingContent(
+                    thinking="Checked the turn.",
+                    thinking_signature=json.dumps(
+                        {
+                            "type": "reasoning",
+                            "id": "rs_1",
+                            "encrypted_content": "encrypted",
+                            "summary": [
+                                {
+                                    "type": "summary_text",
+                                    "text": "Checked the turn.",
+                                }
+                            ],
+                            "status": "completed",
+                        }
+                    ),
+                )
+            ],
+            api="openai-responses",
+            provider="openai",
+            model="gpt-5.4-mini",
+            timestamp=1,
+        )
+
+        result = convert_responses_messages(model, Context(messages=[source]))
+
+        assert result == [
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "encrypted",
+                "summary": [
+                    {
+                        "type": "summary_text",
+                        "text": "Checked the turn.",
+                    }
+                ],
+            }
+        ]
+
     def test_convert_responses_tools(self):
         from pi_ai.providers.openai_responses_shared import convert_responses_tools
         tool = MagicMock()
