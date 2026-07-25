@@ -35,6 +35,10 @@ _LABELS = {
     "CRYPTO": "CRYPTO",
     "MEDICAL_LICENSE": "MEDLIC",
     "AWS_KEY": "AWS_KEY",
+    # Weak, phone-shaped numerics that lack strong phone signals (no country
+    # code, no parenthesized area code, <10 digits). Masked generically so a
+    # tracking id / local extension isn't asserted to be a real phone number.
+    "AMBIGUOUS_NUMERIC": "REDACTED",
 }
 
 
@@ -53,6 +57,33 @@ _PHONE_RE = re.compile(
     r"(?<!\w)(?:\+?\d{1,3}[\s.\-]?)?(?:\(\d{2,4}\)[\s.\-]?)?\d{2,4}[\s.\-]\d{2,4}[\s.\-]?\d{2,4}(?!\w)"
 )
 _CC_RE = re.compile(r"(?<!\d)(?:\d[ \-]?){13,19}(?!\d)")
+
+# Dates and timestamps the phone regex would otherwise misfire on. Dates are
+# not PII: `2026-07-25` and `2026-07-25-12-04-51` / `2026-07-25T12:04:51` are
+# calendar values, not phone numbers. Tokenizing them corrupts file paths and
+# downstream reasoning, so any phone-shaped match that contains one of these is
+# excluded from PHONE detection entirely.
+_DATETIME_RES = (
+    # YYYY-MM-DD optionally followed by a [T|-|space]HH:MM[:SS] time part.
+    re.compile(r"\b\d{4}-\d{2}-\d{2}(?:[T\-\s]\d{2}:\d{2}(?::\d{2})?)?\b"),
+    # YYYY-MM-DD-HH-MM-SS (all dash-separated, e.g. artifact filename stamps).
+    re.compile(r"\b\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}\b"),
+)
+
+
+def _looks_like_datetime(s: str) -> bool:
+    return any(rx.search(s) for rx in _DATETIME_RES)
+
+
+def _is_strong_phone(val: str) -> bool:
+    """A match is a *real* phone only with strong signal: an international
+    prefix (``+``), a parenthesized area code, or 10+ digits. Anything weaker
+    (7-9 bare digits, no formatting) is treated as an ambiguous numeric."""
+    if "+" in val:
+        return True
+    if "(" in val and ")" in val:
+        return True
+    return sum(c.isdigit() for c in val) >= 10
 
 
 def _luhn_ok(digits: str) -> bool:
@@ -82,12 +113,24 @@ def _regex_detect(text: str) -> list[tuple[str, str]]:
     for m in _AWS_KEY_RE.finditer(text):
         found.append((m.group(0), "AWS_KEY"))
     for m in _CC_RE.finditer(text):
-        if _luhn_ok(m.group(0)):
-            found.append((m.group(0).strip(), "CREDIT_CARD"))
+        val = m.group(0).strip()
+        # A dash-separated timestamp (e.g. 2026-07-25-12-04-51) can have 13-19
+        # digits and coincidentally pass Luhn — it is a date, not a card number.
+        if _looks_like_datetime(val):
+            continue
+        if _luhn_ok(val):
+            found.append((val, "CREDIT_CARD"))
     for m in _PHONE_RE.finditer(text):
         val = m.group(0).strip()
-        if sum(c.isdigit() for c in val) >= 7:
+        if sum(c.isdigit() for c in val) < 7:
+            continue
+        # Dates/timestamps are not phone numbers — never tokenize them.
+        if _looks_like_datetime(val):
+            continue
+        if _is_strong_phone(val):
             found.append((val, "PHONE_NUMBER"))
+        else:
+            found.append((val, "AMBIGUOUS_NUMERIC"))
     return found
 
 

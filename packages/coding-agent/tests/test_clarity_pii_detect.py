@@ -1,0 +1,82 @@
+"""Tests for clarity_pii PII detection (detect.py).
+
+Regression coverage for the date-as-phone / date-as-card misclassification:
+dates and timestamps are NOT PII and must never be tokenized, while genuine
+phone numbers and credit cards must still be detected.
+"""
+from __future__ import annotations
+
+from pi_coding_agent.clarity_pii.detect import detect
+
+
+def _types(text: str) -> list[str]:
+    return [etype for _, etype in detect(text)]
+
+
+class TestDatesAreNotPII:
+    def test_plain_date_is_not_a_phone(self):
+        # The exact production failure: an ISO date was masked as [PII:PHONE:1],
+        # corrupting a file path (/tmp/atlas-qual-validation-2026-07-25.md).
+        assert "PHONE_NUMBER" not in _types("2026-07-25")
+
+    def test_plain_date_is_not_detected_at_all(self):
+        assert detect("2026-07-25") == []
+
+    def test_dash_timestamp_is_not_a_phone(self):
+        assert "PHONE_NUMBER" not in _types("2026-07-25-12-04-51")
+
+    def test_dash_timestamp_is_not_a_credit_card(self):
+        # 14 dash-separated digits can coincidentally pass Luhn; a date is not
+        # a card number.
+        assert "CREDIT_CARD" not in _types("2026-07-25-12-04-51")
+
+    def test_dash_timestamp_is_not_detected_at_all(self):
+        assert detect("2026-07-25-12-04-51") == []
+
+    def test_iso_t_timestamp_is_not_pii(self):
+        assert detect("2026-07-25T12:04:51") == []
+
+    def test_date_inside_a_path_is_left_intact(self):
+        assert detect("/tmp/atlas-qual-validation-2026-07-25.md") == []
+
+    def test_date_embedded_in_text_is_not_pii(self):
+        assert detect("backup taken 2026-07-25-12-04-51 done") == []
+
+
+class TestGenuinePhonesStillDetected:
+    def test_international_prefix_phone(self):
+        assert "PHONE_NUMBER" in _types("call +1 415-555-0132 now")
+
+    def test_parenthesized_area_code_phone(self):
+        assert "PHONE_NUMBER" in _types("reach me at (415) 555-0132")
+
+    def test_ten_digit_formatted_phone(self):
+        # 10 digits with separators (no country code / parens) → strong phone.
+        assert "PHONE_NUMBER" in _types("my cell is 415-555-0132")
+
+
+class TestAmbiguousNumericDowngrade:
+    def test_weak_seven_digit_is_ambiguous_not_phone(self):
+        # 7-9 bare digits, no country code / parens → generic, not asserted phone.
+        types = _types("ext 555-1234 please")
+        assert "PHONE_NUMBER" not in types
+        assert "AMBIGUOUS_NUMERIC" in types
+
+    def test_ambiguous_numeric_maps_to_generic_label(self):
+        from pi_coding_agent.clarity_pii.detect import label_for
+
+        assert label_for("AMBIGUOUS_NUMERIC") == "REDACTED"
+
+
+class TestOtherRecognizersUnaffected:
+    def test_email_still_detected(self):
+        assert "EMAIL_ADDRESS" in _types("write me@example.com anytime")
+
+    def test_ssn_still_detected(self):
+        assert "US_SSN" in _types("ssn 123-45-6789")
+
+    def test_real_credit_card_still_detected(self):
+        assert "CREDIT_CARD" in _types("card 4111 1111 1111 1111")
+
+    def test_ipv4_still_detected(self):
+        assert "IP_ADDRESS" in _types("host 192.168.0.1")
