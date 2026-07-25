@@ -218,6 +218,23 @@ def get_project_sessions_dir(cwd: str | None = None) -> str:
     return os.path.join(get_project_agent_dir(cwd), "sessions")
 
 
+def get_active_config_dir(cwd: str | None = None) -> str:
+    """Return the config root owned by the active Tau agent.
+
+    An explicit PI_/TAU_CODING_AGENT_DIR identifies an agent definition even
+    when its subprocess cwd is a different target project. Without an explicit
+    override, the active config root is the launched project's ``.tau`` dir.
+    """
+    if agent_dir_env():
+        return os.path.abspath(os.path.expanduser(get_agent_dir()))
+    return os.path.abspath(get_project_config_dir(cwd))
+
+
+def get_active_sessions_dir(cwd: str | None = None) -> str:
+    """Return the session directory owned by the active Tau agent."""
+    return os.path.join(get_active_config_dir(cwd), "agent", "sessions")
+
+
 def migrate_legacy_global_config() -> None:
     """One-time: seed the new global dir (~/.tau/agent) with auth + models
     from the legacy Node dir (~/.pi/agent) so existing API keys keep working.
@@ -329,16 +346,23 @@ def ensure_project_settings(cwd: str | None = None) -> str | None:
     return settings_path
 
 
-def ensure_memory_store(cwd: str | None = None) -> str | None:
-    """Guarantee the project-local memory store exists at
-    <cwd>/.tau/memory/memory.db (dir + schema'd SQLite db). Returns the db
-    path if it was just created, else None. Never touches an existing db.
+def ensure_memory_store(
+    cwd: str | None = None,
+    *,
+    config_dir: str | None = None,
+) -> str | None:
+    """Guarantee a memory store exists below the selected Tau config root.
+
+    The default remains ``<cwd>/.tau/memory/memory.db``. ``config_dir`` lets
+    startup initialize an explicit agent definition whose subprocess cwd is a
+    different target project. Returns the db path if it was just created, else
+    None. Never touches an existing db.
 
     Offline: instantiating the store creates the dir and schema only — no
     embedding/Ollama call happens until something is actually written.
     """
     base = cwd or os.getcwd()
-    mem_dir = os.path.join(get_project_config_dir(base), "memory")
+    mem_dir = os.path.join(config_dir or get_project_config_dir(base), "memory")
     db_path = os.path.join(mem_dir, "memory.db")
     if os.path.exists(db_path):
         return None
@@ -347,12 +371,51 @@ def ensure_memory_store(cwd: str | None = None) -> str | None:
         # module, so a top-level import would be circular.
         from pi_coding_agent.core.memory.store import MemoryStore
 
-        store = MemoryStore(base)
+        os.makedirs(mem_dir, exist_ok=True)
+        store = MemoryStore(base, db_path=db_path)
         store.close()
     except Exception:
         # Memory is an optional capability; never let a store hiccup block init.
         return None
     return db_path if os.path.exists(db_path) else None
+
+
+def ensure_agent_runtime_directories(
+    cwd: str | None = None,
+    *,
+    session_dir: str | None = None,
+) -> list[str]:
+    """Restore ignored runtime state required by the active Tau agent.
+
+    Agent checkouts intentionally omit sessions and the SQLite memory store.
+    Recreate both independently of session-persistence and memory-enable flags
+    so a first launch cannot leave a partially initialized ``.tau`` tree.
+    """
+    base = cwd or os.getcwd()
+    config_dir = get_active_config_dir(base)
+    agent_dir = os.path.join(config_dir, "agent")
+    sessions_dir = (
+        os.path.abspath(os.path.expanduser(session_dir))
+        if session_dir
+        else get_active_sessions_dir(base)
+    )
+    created: list[str] = []
+
+    # An explicit session directory is the runtime owner. The agent definition
+    # may be a read-only bind mount (Charlie production), so do not synthesize
+    # an otherwise-unused agent directory beside its source files.
+    if not session_dir and not os.path.isdir(agent_dir):
+        os.makedirs(agent_dir, mode=0o700, exist_ok=True)
+        created.append(agent_dir)
+    if not os.path.isdir(sessions_dir):
+        os.makedirs(sessions_dir, mode=0o700, exist_ok=True)
+        created.append(sessions_dir)
+
+    memory_db = ensure_memory_store(base, config_dir=config_dir)
+    if memory_db:
+        created.append(memory_db)
+
+    return created
 
 
 def ensure_project_agent_config(cwd: str | None = None) -> list[str]:

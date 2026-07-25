@@ -573,3 +573,135 @@ def test_create_runtime_host_respects_inherit(tmp_path, monkeypatch, inherit, ex
         assert loaded == [ext]
     else:
         assert loaded == []
+
+
+@pytest.mark.parametrize("no_session", [False, True])
+@pytest.mark.asyncio
+async def test_tau_startup_restores_explicit_agent_runtime_directories_before_extensions(
+    tmp_path,
+    monkeypatch,
+    no_session: bool,
+) -> None:
+    """Devin-style child startup repairs the child, not its target project."""
+    import sqlite3
+
+    from pi_coding_agent import main as main_mod
+
+    home = tmp_path / "home"
+    target_project = tmp_path / "target-project"
+    planner_root = tmp_path / "Agents" / "Devin" / ".tau" / "subagents" / "planner"
+    planner_config = planner_root / ".tau"
+    planner_extensions = planner_config / "extensions"
+    home.mkdir()
+    target_project.mkdir()
+    planner_extensions.mkdir(parents=True)
+    (planner_config / "settings.json").write_text(
+        json.dumps({"memory_enabled": False}),
+        encoding="utf-8",
+    )
+
+    # The first extension pass records whether runtime restoration happened
+    # before extension activation. Later activation passes append rather than
+    # overwrite, so a late repair cannot hide an initial failure.
+    (planner_extensions / "runtime_probe.py").write_text(
+        "from pathlib import Path\n"
+        "ROOT = Path(__file__).resolve().parents[1]\n"
+        "PROBE = ROOT / 'runtime-probe.txt'\n"
+        "def activate(api):\n"
+        "    ready = (ROOT / 'agent' / 'sessions').is_dir() and "
+        "(ROOT / 'memory' / 'memory.db').is_file()\n"
+        "    with PROBE.open('a', encoding='utf-8') as handle:\n"
+        "        handle.write(f'{ready}\\n')\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.chdir(target_project)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    monkeypatch.setenv("TAU_CODING_AGENT_DIR", str(planner_config))
+
+    async def no_piped_stdin() -> None:
+        return None
+
+    monkeypatch.setattr(main_mod, "_read_piped_stdin", no_piped_stdin)
+
+    args = [
+        "--list-models",
+        "--offline",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-context-files",
+    ]
+    if no_session:
+        args.append("--no-session")
+
+    assert await main_mod._run(args) == 0
+
+    sessions_dir = planner_config / "agent" / "sessions"
+    memory_db = planner_config / "memory" / "memory.db"
+    assert sessions_dir.is_dir()
+    assert memory_db.is_file()
+    assert not (target_project / ".tau" / "agent").exists()
+
+    probe_states = (planner_config / "runtime-probe.txt").read_text(encoding="utf-8").splitlines()
+    assert probe_states
+    assert set(probe_states) == {"True"}
+
+    tables = {
+        row[0]
+        for row in sqlite3.connect(memory_db).execute(
+            "select name from sqlite_master where type='table'"
+        ).fetchall()
+    }
+    assert {"semantic_memory", "conversation_memory"} <= tables
+
+    session_files = list(sessions_dir.glob("*.jsonl"))
+    assert bool(session_files) is not no_session
+
+
+@pytest.mark.asyncio
+async def test_tau_startup_uses_explicit_session_dir_with_read_only_agent_definition(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Charlie-style read-only agent sources keep runtime state out-of-tree."""
+    from pi_coding_agent import main as main_mod
+
+    home = tmp_path / "home"
+    agent_root = tmp_path / "charlie" / "ea"
+    config_dir = agent_root / ".tau"
+    external_sessions = tmp_path / "runtime" / "sessions"
+    home.mkdir()
+    config_dir.mkdir(parents=True)
+    (config_dir / "settings.json").write_text(
+        json.dumps({"memory_enabled": False}),
+        encoding="utf-8",
+    )
+    config_dir.chmod(0o555)
+
+    monkeypatch.chdir(agent_root)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    monkeypatch.delenv("TAU_CODING_AGENT_DIR", raising=False)
+
+    async def no_piped_stdin() -> None:
+        return None
+
+    monkeypatch.setattr(main_mod, "_read_piped_stdin", no_piped_stdin)
+
+    try:
+        assert await main_mod._run([
+            "--list-models",
+            "--offline",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-context-files",
+            "--session-dir",
+            str(external_sessions),
+        ]) == 0
+    finally:
+        config_dir.chmod(0o755)
+
+    assert external_sessions.is_dir()
+    assert not (config_dir / "agent").exists()

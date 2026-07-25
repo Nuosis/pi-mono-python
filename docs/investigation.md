@@ -70,3 +70,90 @@ failure.
 This evidence proves the provider callback contract. It does not yet prove the
 Claire voice workflow; that requires publishing, deploying, and replaying the
 exact production route and utterance.
+
+---
+
+## Tau startup runtime directories — 2026-07-16
+
+### Problem
+
+A cloned Tau agent can start without restoring the ignored
+`.tau/agent/sessions` and `.tau/memory` runtime directories that exist in an
+already-used agent such as Devin's Planner.
+
+### Observable success
+
+Starting Tau in a clean agent checkout recreates `.tau/agent/sessions` and a
+schema-initialized `.tau/memory/memory.db`. `--no-session` still restores the
+required directory layout but does not persist a session JSONL file.
+
+### Hypothesis list
+
+| # | Hypothesis | Null hypothesis | Status |
+|---|------------|-----------------|--------|
+| 1 | Normal startup creates sessions but only `--init` creates memory | A normal startup creates both runtime stores | FALSIFIED by isolated startup |
+| 2 | In-memory/no-session startup can omit the whole agent directory | Startup restores required directories independently of session persistence | FALSIFIED by isolated startup |
+| 3 | A cwd-rooted repair is sufficient for Devin subagents | Devin's explicit agent root and subprocess cwd resolve to the same directory | FALSIFIED by Devin's launch environment and an adversarial replay |
+
+### Debug evidence
+
+An isolated `0.56.19` startup using the real `--list-models --offline` path
+created `.tau/agent/sessions/<session-id>.jsonl` and `.tau/settings.json`, but
+no `.tau/memory`. `SessionManager.in_memory()` performs no project-directory
+creation, while `ensure_memory_store()` is only called from `scaffold_project()`
+on the explicit `--init` path.
+
+Devin launches Planner with `TAU_CODING_AGENT_DIR=<planner>/.tau` while the
+subprocess cwd remains the target project. An initial cwd-only repair passed its
+test but left Planner's `.tau` untouched in that real topology. The regression
+was replaced with a distinct-agent-root/distinct-target-project startup whose
+extension records the runtime layout visible during its first activation.
+
+### Current hypothesis
+
+Root cause confirmed: runtime-directory restoration had no startup owner, and
+session routing ignored the explicit active agent root. Startup now resolves
+the explicit PI/TAU agent directory first (falling back to `<cwd>/.tau`),
+initializes sessions and memory before extension loading, and routes persistent
+session JSONL files into that active agent's sessions directory. The focused
+Devin-topology regression passes for persistent and `--no-session` launches.
+
+---
+
+## Read-only agent definition with external sessions — 2026-07-16
+
+### Problem
+
+`agent charlie` launches the selected production persona from the read-only
+`/opt/agents` bind mount and supplies a writable external `--session-dir`.
+Tau 0.56.21 nevertheless tries to create `.tau/agent/sessions` below the
+persona source before launch and exits with `PermissionError`.
+
+### Observable success
+
+Tau starts from a read-only agent definition when `--session-dir` points at a
+writable external location, creates that external directory when needed, and
+does not attempt to create `.tau/agent` inside the read-only source tree. The
+literal `agent charlie` EA route must then reach the interactive TUI.
+
+### Hypothesis list
+
+| # | Hypothesis | Null hypothesis | Status |
+|---|------------|-----------------|--------|
+| 1 | The Charlie bind mount is unwritable to the container user | The selected persona's `.tau` directory is writable to `appuser` | FALSIFIED by `test -w` and the read-only mount readback |
+| 2 | The launcher omits an external runtime path | The launcher passes a writable `--session-dir` | FALSIFIED by the literal launcher command and writable-volume readback |
+| 3 | Startup ignores the parsed session override during runtime restoration | Startup routes initial directory creation through `first_pass.session_dir` | FALSIFIED by the deployed traceback and non-interactive reproduction |
+
+### Debug evidence
+
+The deployed container runs as `uid=1000(appuser)`. `/opt/agents` is mounted
+read-only and `/data/project-agents` is mounted read-write. The launcher passes
+`--session-dir /data/project-agents/.charlie-tui-home/sessions`, but the
+traceback shows `ensure_agent_runtime_directories(os.getcwd())` attempting
+`/opt/agents/charlie/ea/.tau/agent/sessions` before the parsed override is used.
+
+### Current hypothesis
+
+Root cause confirmed: startup runtime restoration does not receive the already
+parsed explicit session directory. It must treat that directory as the session
+runtime owner and leave the agent definition tree untouched.
