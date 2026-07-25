@@ -7,6 +7,7 @@ and stream function scaffolding for bedrock, vertex, azure, responses, codex.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -620,6 +621,76 @@ class TestOpenAIResponsesParams:
         assert result.content[0].text == "Hello"
         assert result.usage.input == 5
         assert result.usage.cache_read == 2
+
+    @pytest.mark.asyncio
+    async def test_openai_responses_serializes_typed_reasoning_summary(self):
+        from pi_ai.providers.openai_responses import stream_openai_responses
+
+        class TypedSummary:
+            text = "Checked every direct question."
+
+            def model_dump(self):
+                return {"type": "summary_text", "text": self.text}
+
+        class TypedReasoning:
+            type = "reasoning"
+            id = "rs_1"
+            encrypted_content = "encrypted"
+            summary = [TypedSummary()]
+
+            def model_dump(self):
+                return {
+                    "type": self.type,
+                    "id": self.id,
+                    "encrypted_content": self.encrypted_content,
+                    "summary": [item.model_dump() for item in self.summary],
+                }
+
+        reasoning = TypedReasoning()
+
+        async def response_events():
+            yield {"type": "response.output_item.added", "item": reasoning}
+            yield {"type": "response.output_item.done", "item": reasoning}
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 7,
+                        "output_tokens": 3,
+                        "total_tokens": 10,
+                        "input_tokens_details": {"cached_tokens": 0},
+                    },
+                },
+            }
+
+        responses = SimpleNamespace(
+            create=AsyncMock(side_effect=lambda **_: response_events())
+        )
+        client = SimpleNamespace(responses=responses)
+
+        with patch("openai.AsyncOpenAI", return_value=client):
+            stream = stream_openai_responses(
+                _make_model(
+                    id_="gpt-5.4-mini",
+                    provider="openai",
+                    api="openai-responses",
+                    reasoning=True,
+                ),
+                _make_context(),
+                {"api_key": "test-key", "reasoning_effort": "low"},
+            )
+            events = [event async for event in stream]
+
+        assert events[-1]["type"] == "done"
+        result = await stream.result()
+        assert result.content[0].thinking == "Checked every direct question."
+        assert json.loads(result.content[0].thinking_signature)["summary"] == [
+            {
+                "type": "summary_text",
+                "text": "Checked every direct question.",
+            }
+        ]
 
     @pytest.mark.asyncio
     async def test_openai_responses_emits_one_raw_response_envelope(self):

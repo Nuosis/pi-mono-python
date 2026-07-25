@@ -52,6 +52,22 @@ _OPENAI_TOOL_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
 _OPENAI_TOOL_NAME_MAX_LENGTH = 64
 
 
+def _provider_object_dict(value: Any) -> dict[str, Any]:
+    """Return a recursively serializable provider object mapping."""
+    if isinstance(value, dict):
+        return value
+    for attr in ("model_dump", "to_dict", "dict"):
+        serializer = getattr(value, attr, None)
+        if callable(serializer):
+            try:
+                result = serializer()
+            except Exception:
+                continue
+            if isinstance(result, dict):
+                return result
+    return dict(getattr(value, "__dict__", {}) or {})
+
+
 def provider_safe_tool_name(name: str) -> str:
     """Encode an internal tool name for OpenAI without losing the local name."""
     if (
@@ -295,7 +311,7 @@ async def process_responses_stream(
             item_type = item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
 
             if item_type == "reasoning":
-                current_item = item if isinstance(item, dict) else item.__dict__
+                current_item = _provider_object_dict(item)
                 current_block = ThinkingContent(thinking="")
                 output.content.append(current_block)
                 stream.push({"type": "thinking_start", "content_index": block_index(), "partial": output})
@@ -307,7 +323,7 @@ async def process_responses_stream(
                 stream.push({"type": "text_start", "content_index": block_index(), "partial": output})
 
             elif item_type == "function_call":
-                item_dict = item if isinstance(item, dict) else item.__dict__
+                item_dict = _provider_object_dict(item)
                 call_id = item_dict.get("call_id", "")
                 item_id = item_dict.get("id", "")
                 tool_name = (tool_name_map or {}).get(
@@ -365,7 +381,7 @@ async def process_responses_stream(
 
         elif event_type == "response.output_item.done":
             item = event.get("item") if isinstance(event, dict) else getattr(event, "item", {})
-            item_dict = item if isinstance(item, dict) else (item.__dict__ if item else {})
+            item_dict = _provider_object_dict(item) if item else {}
             item_type = item_dict.get("type")
 
             if item_type == "reasoning" and getattr(current_block, "type", None) == "thinking":
