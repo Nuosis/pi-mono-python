@@ -58,6 +58,40 @@ def stream_openai_responses(
             stop_reason="stop",
             timestamp=int(time.time() * 1000),
         )
+        raw_response_events: list[Any] = []
+        final_response: Any | None = None
+        response_notified = False
+
+        async def capture_response_events(openai_stream: Any) -> Any:
+            """Preserve provider-native stream events before Tau normalizes them."""
+            nonlocal final_response
+            async for event in openai_stream:
+                raw_response_events.append(event)
+                event_type = event.get("type") if isinstance(event, dict) else getattr(event, "type", None)
+                if event_type == "response.completed":
+                    final_response = (
+                        event.get("response")
+                        if isinstance(event, dict)
+                        else getattr(event, "response", None)
+                    )
+                yield event
+
+        async def notify_response() -> None:
+            """Expose one complete or partial provider-native response envelope."""
+            nonlocal response_notified
+            callback = opts.get("on_response")
+            if callback is None or response_notified:
+                return
+            response_notified = True
+            result = callback(
+                {
+                    "events": list(raw_response_events),
+                    "final_response": final_response,
+                },
+                model,
+            )
+            if hasattr(result, "__await__"):
+                await result
 
         try:
             api_key = opts.get("api_key") or get_env_api_key(model.provider) or ""
@@ -73,13 +107,14 @@ def stream_openai_responses(
             ev_stream.push({"type": "start", "partial": output})
 
             await process_responses_stream(
-                openai_stream,
+                capture_response_events(openai_stream),
                 output,
                 ev_stream,
                 model,
                 service_tier=opts.get("service_tier"),
                 apply_service_tier_pricing=_apply_service_tier_pricing,
             )
+            await notify_response()
 
             if output.stop_reason in ("aborted", "error"):
                 raise RuntimeError("An unknown error occurred")
@@ -88,6 +123,7 @@ def stream_openai_responses(
             ev_stream.end(output)
 
         except Exception as exc:
+            await notify_response()
             for b in output.content:
                 if isinstance(b, dict):
                     b.pop("index", None)

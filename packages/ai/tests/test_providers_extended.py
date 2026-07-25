@@ -569,6 +569,73 @@ class TestOpenAIResponsesParams:
         assert result.usage.cache_read == 2
 
     @pytest.mark.asyncio
+    async def test_openai_responses_emits_one_raw_response_envelope(self):
+        from pi_ai.providers.openai_responses import stream_openai_responses
+
+        raw_events = [event async for event in self._fake_response_events()]
+
+        async def event_stream():
+            for event in raw_events:
+                yield event
+
+        responses = SimpleNamespace()
+        responses.create = AsyncMock(side_effect=lambda **_: event_stream())
+        client = SimpleNamespace(responses=responses)
+        observed = []
+
+        async def on_response(response, model):
+            observed.append((response, model))
+
+        with patch("openai.AsyncOpenAI", return_value=client):
+            stream = stream_openai_responses(
+                _make_model(id_="gpt-5.5", provider="openai", api="openai-responses"),
+                _make_context(),
+                {"api_key": "test-key", "on_response": on_response},
+            )
+            events = [event async for event in stream]
+
+        assert events[-1]["type"] == "done"
+        assert len(observed) == 1
+        envelope, callback_model = observed[0]
+        assert envelope["events"] == raw_events
+        assert envelope["final_response"] == raw_events[-1]["response"]
+        assert callback_model.id == "gpt-5.5"
+
+    @pytest.mark.asyncio
+    async def test_openai_responses_emits_partial_raw_response_when_stream_fails(self):
+        from pi_ai.providers.openai_responses import stream_openai_responses
+
+        raw_event = {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_partial"},
+        }
+
+        async def failing_event_stream():
+            yield raw_event
+            raise RuntimeError("stream broke after first event")
+
+        responses = SimpleNamespace()
+        responses.create = AsyncMock(side_effect=lambda **_: failing_event_stream())
+        client = SimpleNamespace(responses=responses)
+        observed = []
+
+        async def on_response(response, _model):
+            observed.append(response)
+
+        with patch("openai.AsyncOpenAI", return_value=client):
+            stream = stream_openai_responses(
+                _make_model(id_="gpt-5.5", provider="openai", api="openai-responses"),
+                _make_context(),
+                {"api_key": "test-key", "on_response": on_response},
+            )
+            events = [event async for event in stream]
+
+        assert events[-1]["type"] == "error"
+        assert len(observed) == 1
+        assert observed[0]["events"] == [raw_event]
+        assert observed[0]["final_response"] is None
+
+    @pytest.mark.asyncio
     async def test_azure_openai_responses_handles_awaitable_create_and_typed_output(self):
         from pi_ai.providers.azure_openai_responses import stream_azure_openai_responses
 
