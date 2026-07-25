@@ -25,6 +25,7 @@ from pi_coding_agent.clarity_pii.walk import (
     apply_to_message,
     deep_copy_message,
     dict_string_slots,
+    provider_payload_string_slots,
 )
 
 BRAND = "Tau by Clarity"
@@ -96,7 +97,7 @@ def extension_factory(pi: Any) -> None:
         if not isinstance(payload, dict):
             return None
         vault: Vault = state["vault"]
-        for get, set_ in dict_string_slots(payload):
+        for get, set_ in provider_payload_string_slots(payload):
             try:
                 set_(vault.tokenize(get()))
             except Exception:
