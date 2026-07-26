@@ -19,6 +19,7 @@ from typing import Any
 # Absolute imports: the extension loader execs this file standalone (module name
 # `pi_ext_extension`), so relative imports would have no parent package. The
 # clarity_pii package is installed/importable, so absolute imports resolve.
+from pi_coding_agent.clarity_pii import set_active_vault
 from pi_coding_agent.clarity_pii.detect import get_presidio
 from pi_coding_agent.clarity_pii.vault import Vault, load_artifact, save_artifact
 from pi_coding_agent.clarity_pii.walk import (
@@ -48,14 +49,21 @@ def _set_flag(pi: Any, name: str, value: bool) -> None:
 def extension_factory(pi: Any) -> None:
     state: dict[str, Any] = {"vault": Vault(), "session_id": "", "loaded": False}
 
+    def _save() -> None:
+        # Lazy + session-referenced: writes only when the vault has PII.
+        save_artifact(_vault_dir(), state["session_id"], state["vault"])
+
+    def _publish() -> None:
+        # Hand the session vault to pi_ai's universal filter so the detokenizer it
+        # applies to streamed deltas and the final message can restore tokens this
+        # session minted — the owner sees cleartext, the provider never did.
+        set_active_vault(state["vault"], _save)
+
     def _load(session_id: str) -> None:
         state["session_id"] = session_id
         state["loaded"] = True
         state["vault"] = load_artifact(_vault_dir(), session_id)
-
-    def _save() -> None:
-        # Lazy + session-referenced: writes only when the vault has PII.
-        save_artifact(_vault_dir(), state["session_id"], state["vault"])
+        _publish()
 
     def _enabled() -> bool:
         val = pi.get_flag(FLAG_NAME)
@@ -145,6 +153,7 @@ def extension_factory(pi: Any) -> None:
             return f"{BRAND} disabled — PII will be sent to the provider in cleartext."
         if sub == "clear":
             state["vault"] = Vault()
+            _publish()  # the filter must follow the replacement, not the old vault
             _save()  # empty vault → artifact removed
             return "PII vault cleared."
         if sub == "vault":
