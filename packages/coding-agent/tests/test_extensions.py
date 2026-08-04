@@ -29,6 +29,26 @@ class TestExtensionTypes:
         assert tool.name == "my_tool"
         assert tool.description == "A tool"
 
+    def test_extension_api_preserves_tool_argument_preparer(self):
+        from pi_coding_agent.core.extensions.types import Extension, ExtensionAPI
+
+        extension = Extension(
+            path="/test/extension.py",
+            resolved_path="/test/extension.py",
+        )
+        api = ExtensionAPI(extension)
+        prepare = lambda args: {str(key).lower(): value for key, value in args.items()}
+
+        api.register_tool(
+            name="case_safe",
+            description="Normalize known parameter casing before validation.",
+            parameters={"type": "object", "properties": {"basis": {"type": "string"}}},
+            execute=lambda *_args: None,
+            prepareArguments=prepare,
+        )
+
+        assert extension.tools["case_safe"].prepare_arguments is prepare
+
     def test_registered_command_creation(self):
         from pi_coding_agent.core.extensions.types import RegisteredCommand
         cmd = RegisteredCommand(

@@ -1064,8 +1064,16 @@ def main(args: Sequence[str] | None = None) -> None:
     run_args = args if args is not None else sys.argv[1:]
     _dispatch_to_local_project(run_args, os.getcwd())
     configure_cli_debug_logging(cwd=os.getcwd(), argv=run_args)
+    async def run_and_flush() -> int:
+        try:
+            return await _run(run_args)
+        finally:
+            from .core.clarity_instrumentation import flush
+
+            await flush()
+
     try:
-        exit_code = asyncio.run(_run(run_args))
+        exit_code = asyncio.run(run_and_flush())
     except BaseException as exc:
         log_exception("unhandled_exception", exc)
         raise

@@ -9,8 +9,9 @@ clarity-backend forwards to Langfuse. Query them back per session/correlation.
 Design:
 - **Env-gated.** No-op unless a base URL + token are configured. Never a hard
   dependency, never changes agent behaviour.
-- **Fire-and-forget.** Emits are scheduled on the running loop and awaited
-  nowhere; a slow or failing sink can never block or crash the agent turn.
+- **Asynchronous delivery.** Emits are scheduled on the running loop while the
+  agent works, then pending deliveries are flushed at CLI shutdown. A slow or
+  failing sink can never crash or change the result of the agent turn.
 - **Safe serialization + size caps.** Arbitrary provider payloads are coerced to
   JSON-able structures and capped so a huge context can't blow the sink.
 
@@ -18,6 +19,7 @@ Config (first match wins):
 - URL:   TAU_INSTRUMENTATION_URL | CLARITY_BACKEND_BASE_URL | CLARITY_BASE_URL
 - Token: TAU_INSTRUMENTATION_TOKEN | CLARITY_API_KEY
 - Correlation: CLAIRE_SESSION_ID | TAU_SESSION_ID  (tags every event)
+- Role:        TAU_INSTRUMENTATION_ROLE            (optional event tag)
 """
 from __future__ import annotations
 
@@ -31,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_FIELD_CHARS = 200_000  # keep full system prompts; cap only the absurd
 _seq = itertools.count(1)
+_pending: set[asyncio.Task[None]] = set()
 
 
 def _config() -> tuple[str, str] | None:
@@ -133,7 +136,7 @@ def emit(
     output: Any = None,
     metadata: dict[str, Any] | None = None,
 ) -> None:
-    """Schedule one instrumentation event. Fire-and-forget; never raises.
+    """Schedule one asynchronous instrumentation event; never raises.
 
     ``name`` must be alphanumeric + ``_.:-`` per the Clarity route validator.
     """
@@ -147,11 +150,16 @@ def emit(
         # the whole agentic flow is retrievable via
         # GET /clarify/instrumentation/traces?correlation_id=<session_id>.
         md["correlation_id"] = sid
+    role = os.environ.get("TAU_INSTRUMENTATION_ROLE", "").strip()
+    if role:
+        md["role"] = role
     if metadata:
         md.update(metadata)
     try:
         loop = asyncio.get_running_loop()
-        loop.create_task(_post(name, input, output, md))
+        task = loop.create_task(_post(name, input, output, md))
+        _pending.add(task)
+        task.add_done_callback(_pending.discard)
     except RuntimeError:
         # No running loop (rare, e.g. sync init path) — best-effort synchronous.
         try:
@@ -160,4 +168,11 @@ def emit(
             pass
 
 
-__all__ = ["emit", "enabled"]
+async def flush() -> None:
+    """Wait for every scheduled instrumentation delivery to settle."""
+    while _pending:
+        tasks = tuple(_pending)
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+__all__ = ["emit", "enabled", "flush"]

@@ -27,6 +27,62 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
+# ── core/clarity_instrumentation.py ─────────────────────────────────────────
+
+class TestClarityInstrumentation:
+    @pytest.mark.asyncio
+    async def test_flush_waits_for_scheduled_events(self, monkeypatch):
+        from pi_coding_agent.core import clarity_instrumentation as ci
+
+        monkeypatch.setenv(
+            "TAU_INSTRUMENTATION_URL",
+            "https://api.example.test",
+        )
+        monkeypatch.setenv("TAU_INSTRUMENTATION_TOKEN", "clrtok_test")
+        monkeypatch.setenv("TAU_SESSION_ID", "dj-short-process")
+        delivered = []
+
+        async def fake_post(name, input, output, metadata):
+            await asyncio.sleep(0)
+            delivered.append((name, metadata["correlation_id"]))
+
+        monkeypatch.setattr(ci, "_post", fake_post)
+
+        ci.emit("tau.tool_result", output={"status": "done"})
+        assert delivered == []
+        await ci.flush()
+
+        assert delivered == [("tau.tool_result", "dj-short-process")]
+
+    @pytest.mark.asyncio
+    async def test_emit_includes_explicit_agent_role(self, monkeypatch):
+        from pi_coding_agent.core import clarity_instrumentation as ci
+
+        monkeypatch.setenv("TAU_INSTRUMENTATION_URL", "https://api.example.test")
+        monkeypatch.setenv("TAU_INSTRUMENTATION_TOKEN", "clrtok_test")
+        monkeypatch.setenv("TAU_SESSION_ID", "div-run")
+        monkeypatch.setenv("TAU_INSTRUMENTATION_ROLE", "critic")
+        delivered = []
+
+        async def fake_post(name, input, output, metadata):
+            delivered.append(metadata)
+
+        monkeypatch.setattr(ci, "_post", fake_post)
+
+        ci.emit("tau.provider_request")
+        await ci.flush()
+
+        assert delivered == [
+            {
+                "source": "tau",
+                "seq": delivered[0]["seq"],
+                "session_id": "div-run",
+                "correlation_id": "div-run",
+                "role": "critic",
+            }
+        ]
+
+
 # ── core/exec.py ──────────────────────────────────────────────────────────────
 
 class TestExecCommand:
@@ -394,6 +450,26 @@ class TestPrintMode:
         assert d["toolName"] == "example"
         assert d["result"] == {"content": [{"type": "text", "text": "details"}]}
         assert d["isError"] is True
+
+    def test_event_to_dict_preserves_typed_generation_failure_details(self):
+        from pi_agent.types import AgentEventRunState
+        from pi_coding_agent.modes.print_mode import _event_to_dict
+
+        event = AgentEventRunState(
+            state="provider_generation_degenerate",
+            phase="model",
+            reason="exact_repetition_at_length_boundary",
+            terminal=True,
+            details={
+                "kind": "exact_repetition_at_length_boundary",
+                "fingerprint": "stable-cycle",
+            },
+        )
+
+        serialized = _event_to_dict(event)
+
+        assert serialized["terminal"] is True
+        assert serialized["details"]["fingerprint"] == "stable-cycle"
 
     def test_handle_print_event_does_not_raise(self):
         from pi_coding_agent.modes.print_mode import _handle_print_event

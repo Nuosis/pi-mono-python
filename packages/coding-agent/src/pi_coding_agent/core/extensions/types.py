@@ -520,6 +520,9 @@ class ExtensionAPI:
             execute=execute,
             prompt_snippet=prompt_snippet,
             prompt_guidelines=prompt_guidelines,
+            prepare_arguments=kwargs.get(
+                "prepare_arguments", kwargs.get("prepareArguments")
+            ),
             execution_mode=kwargs.get("execution_mode", kwargs.get("executionMode")),
             execution_policy=kwargs.get("execution_policy", kwargs.get("executionPolicy")),
         )

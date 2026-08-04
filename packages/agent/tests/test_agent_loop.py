@@ -594,8 +594,8 @@ async def test_agent_loop_after_tool_call_can_set_termination():
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_executes_tool_batch_in_parallel_by_default():
-    """Same-batch tools should overlap by default and emit result messages in source order."""
+async def test_agent_loop_parallel_batch_stops_when_any_result_requests_termination():
+    """Same-batch tools overlap, preserve result order, and honor one terminal result."""
     from pi_ai import get_model
 
     model = get_model("anthropic", "claude-3-5-sonnet-20241022")
@@ -622,7 +622,7 @@ async def test_agent_loop_executes_tool_batch_in_parallel_by_default():
         return AgentToolResult(
             content=[TextContent(type="text", text="second-overlapped")],
             details={},
-            terminate=True,
+            terminate=False,
         )
 
     first_tool = AgentTool(
@@ -1332,6 +1332,136 @@ async def test_agent_loop_handles_error_event_payload():
         event_types.append(event.type)
 
     assert "agent_end" in event_types
+
+
+def test_detects_length_bound_exact_repetition_as_degenerate_generation():
+    from pi_agent.generation_health import detect_degenerate_generation
+
+    repeated = "back and a little farther "
+    message = AssistantMessage(
+        role="assistant",
+        content=[
+            TextContent(
+                type="text",
+                text="I inspected the requested boundary. " + repeated * 24,
+            )
+        ],
+        api="anthropic-messages",
+        provider="anthropic",
+        model="MiniMax-M2.1",
+        usage=Usage(),
+        stop_reason="length",
+        timestamp=_ts(),
+    )
+
+    failure = detect_degenerate_generation(message)
+
+    assert failure is not None
+    assert failure.kind == "exact_repetition_at_length_boundary"
+    assert failure.repeat_count >= 4
+    assert failure.repeated_token_fraction >= 0.5
+    assert failure.fingerprint
+
+
+def test_does_not_classify_nonperiodic_length_truncation_as_degenerate():
+    from pi_agent.generation_health import detect_degenerate_generation
+
+    prose = " ".join(
+        f"Step {index} checks a distinct observable boundary value {index * 17}."
+        for index in range(80)
+    )
+    message = AssistantMessage(
+        role="assistant",
+        content=[TextContent(type="text", text=prose)],
+        api="anthropic-messages",
+        provider="anthropic",
+        model="MiniMax-M2.1",
+        usage=Usage(),
+        stop_reason="length",
+        timestamp=_ts(),
+    )
+
+    assert detect_degenerate_generation(message) is None
+
+
+def test_does_not_classify_intentionally_uniform_repetition_without_onset():
+    from pi_agent.generation_health import detect_degenerate_generation
+
+    message = AssistantMessage(
+        role="assistant",
+        content=[
+            TextContent(type="text", text="repeat this phrase " * 24)
+        ],
+        api="anthropic-messages",
+        provider="anthropic",
+        model="MiniMax-M2.1",
+        usage=Usage(),
+        stop_reason="length",
+        timestamp=_ts(),
+    )
+
+    assert detect_degenerate_generation(message) is None
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_discards_degenerate_completion_and_emits_recovery_signal():
+    from pi_ai import get_model
+
+    model = get_model("anthropic", "claude-3-5-sonnet-20241022")
+    corrupt_text = "useful prefix " + "back and a little farther " * 24
+
+    async def _stream_degenerate(m, ctx, opts=None):
+        del ctx, opts
+        partial = AssistantMessage(
+            role="assistant",
+            content=[],
+            api=m.api,
+            provider=m.provider,
+            model=m.id,
+            usage=Usage(),
+            stop_reason="stop",
+            timestamp=_ts(),
+        )
+        yield EventStart(type="start", partial=partial)
+        final = partial.model_copy(
+            update={
+                "content": [TextContent(type="text", text=corrupt_text)],
+                "stop_reason": "length",
+            }
+        )
+        yield EventDone(type="done", reason="length", message=final)
+
+    config = AgentLoopConfig(
+        model=model,
+        convert_to_llm=lambda msgs: [
+            message
+            for message in msgs
+            if hasattr(message, "role")
+            and message.role in ("user", "assistant", "toolResult")
+        ],
+    )
+    stream = agent_loop(
+        [make_user_message("Continue from the durable checkpoint")],
+        AgentContext(messages=[]),
+        config,
+        stream_fn=_stream_degenerate,
+    )
+    events = [event async for event in stream]
+
+    final_message = next(
+        event.message for event in events if event.type == "message_end"
+        and getattr(event.message, "role", "") == "assistant"
+    )
+    run_state = next(
+        event for event in events
+        if event.type == "run_state"
+        and event.state == "provider_generation_degenerate"
+    )
+    assert final_message.stop_reason == "error"
+    assert final_message.content == []
+    assert corrupt_text not in (final_message.error_message or "")
+    assert run_state.terminal is True
+    assert run_state.details["fingerprint"]
 
 
 @pytest.mark.asyncio
