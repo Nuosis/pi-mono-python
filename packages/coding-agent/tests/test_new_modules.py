@@ -395,6 +395,26 @@ class TestPrintMode:
         assert d["result"] == {"content": [{"type": "text", "text": "details"}]}
         assert d["isError"] is True
 
+    def test_event_to_dict_preserves_typed_generation_failure_details(self):
+        from pi_agent.types import AgentEventRunState
+        from pi_coding_agent.modes.print_mode import _event_to_dict
+
+        event = AgentEventRunState(
+            state="provider_generation_degenerate",
+            phase="model",
+            reason="exact_repetition_at_length_boundary",
+            terminal=True,
+            details={
+                "kind": "exact_repetition_at_length_boundary",
+                "fingerprint": "stable-cycle",
+            },
+        )
+
+        serialized = _event_to_dict(event)
+
+        assert serialized["terminal"] is True
+        assert serialized["details"]["fingerprint"] == "stable-cycle"
+
     def test_handle_print_event_does_not_raise(self):
         from pi_coding_agent.modes.print_mode import _handle_print_event
 

@@ -23,6 +23,12 @@ from pi_ai.types import (
 from pi_ai.utils.event_stream import EventStream
 from pi_ai.utils.validation import validate_tool_arguments
 
+from .generation_health import (
+    as_generation_error,
+    detect_degenerate_generation,
+    generation_error_details,
+)
+
 from .types import (
     AgentContext,
     AgentEvent,
@@ -250,13 +256,28 @@ async def _run_loop(
             )
             new_messages.append(message)
 
+            generation_failure = generation_error_details(message)
             if message.stop_reason in ("error", "aborted"):
                 _emit_run_state(
                     ev_stream,
-                    "aborted" if message.stop_reason == "aborted" else "provider_error",
+                    (
+                        "provider_generation_degenerate"
+                        if generation_failure is not None
+                        else (
+                            "aborted"
+                            if message.stop_reason == "aborted"
+                            else "provider_error"
+                        )
+                    ),
                     phase="model",
-                    reason=getattr(message, "error_message", None) or message.stop_reason,
+                    reason=(
+                        "exact_repetition_at_length_boundary"
+                        if generation_failure is not None
+                        else getattr(message, "error_message", None)
+                        or message.stop_reason
+                    ),
                     terminal=True,
+                    details=generation_failure,
                 )
                 ev_stream.push(AgentEventTurnEnd(message=message, tool_results=[]))
                 ev_stream.push(AgentEventAgentEnd(messages=new_messages))
@@ -454,6 +475,9 @@ async def _stream_assistant_response(
 
         elif event.type in ("done", "error"):
             final_message = event.message if event.type == "done" else event.error
+            degeneration = detect_degenerate_generation(final_message)
+            if degeneration is not None:
+                final_message = as_generation_error(final_message, degeneration)
             if added_partial:
                 context.messages[-1] = final_message
             else:
@@ -574,7 +598,7 @@ async def _execute_tool_calls_sequential(
 
     return {
         "tool_results": results,
-        "terminate": bool(terminate_flags) and all(terminate_flags),
+        "terminate": any(terminate_flags),
     }
 
 
@@ -652,7 +676,7 @@ async def _execute_tool_calls_parallel(
 
     return {
         "tool_results": results,
-        "terminate": bool(terminate_flags) and all(terminate_flags),
+        "terminate": any(terminate_flags),
     }
 
 
