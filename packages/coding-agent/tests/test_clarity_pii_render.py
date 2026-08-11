@@ -192,6 +192,19 @@ async def test_tool_call_restores_incomplete_tokens_before_execution(
     assert vault.detokenize("[PII:EMAIL:999") == "[PII:EMAIL:999"
 
 
+@pytest.mark.asyncio
+async def test_tool_call_blocks_unresolved_pii_before_execution(tmp_path, monkeypatch):
+    pi = _start_extension(tmp_path, monkeypatch, "session-unresolved-tool-token")
+
+    result = await pi.handlers["tool_call"](
+        {"input": {"service_date": "[PII:DATE:2]"}},
+        SimpleNamespace(session_id="session-unresolved-tool-token"),
+    )
+
+    assert result["block"] is True
+    assert "could not be restored" in result["reason"]
+
+
 # --------------------------------------------------------------------------- #
 # Kill-switch
 # --------------------------------------------------------------------------- #

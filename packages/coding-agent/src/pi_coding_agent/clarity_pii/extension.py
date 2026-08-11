@@ -133,6 +133,22 @@ def extension_factory(pi: Any) -> None:
                     changed = True
             except Exception:
                 continue
+        unresolved = False
+        for get, _set in dict_string_slots(new_args):
+            try:
+                if "[PII:" in get():
+                    unresolved = True
+                    break
+            except Exception:
+                continue
+        if unresolved:
+            return {
+                "block": True,
+                "reason": (
+                    "Tool execution blocked because a PII placeholder could not be "
+                    "restored from the session vault. Retry using the known source fact."
+                ),
+            }
         if not changed:
             return None
         return {"arguments": new_args}
