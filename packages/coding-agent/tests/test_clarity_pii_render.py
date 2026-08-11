@@ -155,6 +155,43 @@ async def test_clear_repoints_the_filter_at_the_new_vault(tmp_path, monkeypatch)
     assert detokenize("[PII:PHONE:1]") == "[PII:PHONE:1]"
 
 
+@pytest.mark.asyncio
+async def test_tool_call_restores_incomplete_tokens_before_execution(
+    tmp_path, monkeypatch
+):
+    pi = _start_extension(tmp_path, monkeypatch, "session-tool-call")
+    vault = clarity_pii.get_active_vault()
+    email_token = vault.tokenize("jas@fvwireless.com")
+    phone_token = vault.tokenize("+1 604-576-6635")
+
+    result = await pi.handlers["tool_call"](
+        {
+            "input": {
+                "contacts": [
+                    {
+                        "email": email_token.removesuffix("]"),
+                        "phone": phone_token.removesuffix("]"),
+                    }
+                ]
+            }
+        },
+        SimpleNamespace(session_id="session-tool-call"),
+    )
+
+    assert result == {
+        "arguments": {
+            "contacts": [
+                {
+                    "email": "jas@fvwireless.com",
+                    "phone": "+1 604-576-6635",
+                }
+            ]
+        }
+    }
+    assert "[PII:" not in str(result)
+    assert vault.detokenize("[PII:EMAIL:999") == "[PII:EMAIL:999"
+
+
 # --------------------------------------------------------------------------- #
 # Kill-switch
 # --------------------------------------------------------------------------- #

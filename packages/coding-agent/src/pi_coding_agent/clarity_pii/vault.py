@@ -19,9 +19,10 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from .detect import TOKEN_RE, detect, label_for, make_token
+from .detect import detect, label_for, make_token
 
 ARTIFACT_SCHEMA = "tau-by-clarity/pii-vault@1"
+_TOOL_TOKEN_RE = re.compile(r"\[PII:[A-Z_]+:\d+\]?")
 
 
 class Vault:
@@ -61,9 +62,15 @@ class Vault:
             return text
 
         def _repl(m: re.Match[str]) -> str:
-            return self._to_value.get(m.group(0), m.group(0))
+            token = m.group(0)
+            canonical = token if token.endswith("]") else f"{token}]"
+            return self._to_value.get(canonical, token)
 
-        return TOKEN_RE.sub(_repl, text)
+        # Providers occasionally omit only the closing bracket when copying a
+        # token into structured tool arguments. Restore that known token from
+        # the session vault too, so no PII placeholder reaches a tool. Unknown
+        # placeholders remain untouched and therefore cannot invent cleartext.
+        return _TOOL_TOKEN_RE.sub(_repl, text)
 
     def to_dict(self) -> dict[str, Any]:
         return {"to_value": dict(self._to_value), "counters": dict(self._counters)}
