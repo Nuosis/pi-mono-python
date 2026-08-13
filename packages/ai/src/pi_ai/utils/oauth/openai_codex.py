@@ -13,6 +13,7 @@ import base64
 import json
 import secrets
 import time
+from collections.abc import Callable
 from urllib.parse import urlencode
 
 import httpx
@@ -61,9 +62,12 @@ async def login_openai_codex(callbacks: OAuthLoginCallbacks) -> OAuthCredentials
         "state": state,
     })
     auth_url = f"{_AUTHORIZE_URL}?{auth_params}"
-    callbacks.on_auth(OAuthAuthInfo(url=auth_url, instructions="Visit the URL to authorize ChatGPT access."))
 
-    code, returned_state = await _wait_for_callback_code()
+    code, returned_state = await _wait_for_callback_code(
+        on_ready=lambda: callbacks.on_auth(
+            OAuthAuthInfo(url=auth_url, instructions="Visit the URL to authorize ChatGPT access.")
+        )
+    )
     if returned_state != state:
         raise ValueError("OAuth state mismatch during OpenAI login")
 
@@ -122,7 +126,7 @@ async def refresh_openai_codex_token(credentials: OAuthCredentials) -> OAuthCred
     return creds
 
 
-async def _wait_for_callback_code() -> tuple[str, str]:
+async def _wait_for_callback_code(on_ready: Callable[[], None] | None = None) -> tuple[str, str]:
     """Start a local HTTP server to receive the OAuth callback."""
     code_future: asyncio.Future[tuple[str, str]] = asyncio.get_event_loop().create_future()
 
@@ -146,11 +150,15 @@ async def _wait_for_callback_code() -> tuple[str, str]:
         site = web.TCPSite(runner, "localhost", _REDIRECT_PORT)
         await site.start()
         try:
+            if on_ready is not None:
+                on_ready()
             return await asyncio.wait_for(code_future, timeout=300)
         finally:
             await runner.cleanup()
 
     except ImportError:
+        if on_ready is not None:
+            on_ready()
         code = await asyncio.get_event_loop().run_in_executor(
             None, input, "Enter the authorization code from the callback URL: "
         )

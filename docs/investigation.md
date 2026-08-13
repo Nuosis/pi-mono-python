@@ -157,3 +157,61 @@ traceback shows `ensure_agent_runtime_directories(os.getcwd())` attempting
 Root cause confirmed: startup runtime restoration does not receive the already
 parsed explicit session directory. It must treat that directory as the session
 runtime owner and leave the agent definition tree untouched.
+
+---
+
+## OpenAI subscription callback race — 2026-08-12
+
+### Problem
+
+Selecting OpenAI subscription login opens Safari, but the successful OpenAI
+authorization redirects to `http://localhost:1455/auth/callback` while nothing
+is listening, so Safari reports that it cannot open the page.
+
+### Observable success
+
+Tau binds the registered OpenAI callback address before opening the browser,
+accepts the real HTTP callback, validates its state, and proceeds to exchange
+the authorization code.
+
+### Hypothesis list
+
+| # | Hypothesis | Null hypothesis | Status |
+|---|------------|-----------------|--------|
+| 1 | Tau opens the browser before starting its callback listener | Port 1455 is accepting connections when Tau invokes `on_auth` | FALSIFIED by socket observation |
+| 2 | The registered callback path is wrong | Tau's authorization request does not use OpenAI's registered `http://localhost:1455/auth/callback` URI | NULLIFIED by the emitted authorization URL and source |
+| 3 | The installed Tau distribution lacks the callback-server dependency | `aiohttp` imports in the isolated `uv tool` environment | FALSIFIED by installed-interpreter `ModuleNotFoundError` |
+
+### Debug evidence
+
+During the real `login_openai_codex()` call order, a socket connection attempted
+inside `on_auth` returned macOS error 61 (`connection refused`). The installed
+Tau 0.56.27 and the workspace source both call `callbacks.on_auth(...)` before
+entering `_wait_for_callback_code()`, which owns server startup.
+
+After rebuilding 0.56.31 from the workspace, its isolated tool interpreter
+raised `ModuleNotFoundError: No module named 'aiohttp'`. The workspace lock had
+`aiohttp` only as a transitive dependency of the pinned Google SDK; a fresh
+tool resolution selected dependencies that did not install it. Tau therefore
+entered its manual-input fallback and never bound port 1455.
+
+### Current hypothesis
+
+Two root causes are confirmed: the installed distribution does not directly
+declare its callback-server dependency, and when that dependency is present,
+browser launch precedes listener startup. The repair must directly require
+`aiohttp` and make listener readiness the prerequisite for invoking `on_auth`,
+while retaining the exact registered callback URI.
+
+### Repair evidence
+
+- The focused OAuth file passes 30 tests from workspace source. The new
+  regression makes a real HTTP request to the fixed callback route and failed
+  with `ConnectionRefusedError` before the lifecycle repair.
+- A fresh `uv tool` install directly resolved `aiohttp 3.14.3` from Tau's
+  package metadata.
+- The repaired installed build completed the literal Tau TUI route
+  `/login` → OpenAI → Subscription against OpenAI. Safari rendered
+  “Authorization complete,” Tau reported “Subscription login stored for
+  OpenAI,” and an encrypted-auth readback confirmed a current OpenAI Codex
+  credential with access token, refresh token, account ID, and future expiry.

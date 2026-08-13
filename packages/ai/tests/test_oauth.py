@@ -6,8 +6,11 @@ Tests PKCE generation, provider registry, and token refresh (mocked HTTP).
 
 from __future__ import annotations
 
+import socket
+import threading
 import time
 from urllib.parse import parse_qs, urlparse
+from urllib.request import urlopen
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -153,11 +156,31 @@ class TestOAuthRegistry:
 
 class TestOpenAICodexOAuthProvider:
     @pytest.mark.asyncio
-    async def test_login_uses_current_authorize_endpoint_and_state(self):
+    async def test_login_starts_callback_server_before_authorization(self):
         from pi_ai.utils.oauth.openai_codex import login_openai_codex
         from pi_ai.utils.oauth.types import OAuthLoginCallbacks
 
-        auth_urls: list[str] = []
+        callback_response: list[str] = []
+        callback_errors: list[BaseException] = []
+        callback_thread: threading.Thread | None = None
+
+        def send_callback() -> None:
+            try:
+                with urlopen(
+                    "http://localhost:1455/auth/callback?code=callback-code&state=state-123",
+                    timeout=2,
+                ) as response:
+                    callback_response.append(response.read().decode())
+            except BaseException as exc:
+                callback_errors.append(exc)
+
+        def on_auth(_info) -> None:
+            nonlocal callback_thread
+            with socket.create_connection(("localhost", 1455), timeout=1):
+                pass
+            callback_thread = threading.Thread(target=send_callback)
+            callback_thread.start()
+
         mock_resp = MagicMock()
         mock_resp.json.return_value = {
             "access_token": "access",
@@ -168,7 +191,50 @@ class TestOpenAICodexOAuthProvider:
         with (
             patch("pi_ai.utils.oauth.openai_codex.generate_pkce", return_value=("verifier", "challenge")),
             patch("pi_ai.utils.oauth.openai_codex.secrets.token_urlsafe", return_value="state-123"),
-            patch("pi_ai.utils.oauth.openai_codex._wait_for_callback_code", AsyncMock(return_value=("code", "state-123"))),
+            patch("pi_ai.utils.oauth.openai_codex.httpx.AsyncClient") as MockClient,
+        ):
+            mock_ctx = AsyncMock()
+            mock_ctx.__aenter__ = AsyncMock(return_value=mock_ctx)
+            mock_ctx.__aexit__ = AsyncMock(return_value=False)
+            mock_ctx.post = AsyncMock(return_value=mock_resp)
+            MockClient.return_value = mock_ctx
+
+            creds = await login_openai_codex(
+                OAuthLoginCallbacks(
+                    on_auth=on_auth,
+                    on_prompt=AsyncMock(return_value=""),
+                )
+            )
+
+        assert callback_thread is not None
+        callback_thread.join(timeout=2)
+        assert callback_errors == []
+        assert callback_response == ["<html><body>Authorization complete! You can close this window.</body></html>"]
+        assert creds.access == "access"
+
+    @pytest.mark.asyncio
+    async def test_login_uses_current_authorize_endpoint_and_state(self):
+        from pi_ai.utils.oauth.openai_codex import login_openai_codex
+        from pi_ai.utils.oauth.types import OAuthLoginCallbacks
+
+        auth_urls: list[str] = []
+
+        async def receive_callback(on_ready=None):
+            if on_ready is not None:
+                on_ready()
+            return "code", "state-123"
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "expires_in": 3600,
+        }
+
+        with (
+            patch("pi_ai.utils.oauth.openai_codex.generate_pkce", return_value=("verifier", "challenge")),
+            patch("pi_ai.utils.oauth.openai_codex.secrets.token_urlsafe", return_value="state-123"),
+            patch("pi_ai.utils.oauth.openai_codex._wait_for_callback_code", side_effect=receive_callback),
             patch("pi_ai.utils.oauth.openai_codex.httpx.AsyncClient") as MockClient,
         ):
             mock_ctx = AsyncMock()
