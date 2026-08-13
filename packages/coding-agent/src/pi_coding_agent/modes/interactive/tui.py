@@ -2870,7 +2870,9 @@ async def _apply_profile_model(
         set_thinking = getattr(session, "set_thinking_level", None)
         if callable(set_thinking):
             set_thinking(effective_thinking)
-        updates["defaultThinkingLevel"] = effective_thinking
+        updates["defaultThinkingLevel"] = getattr(
+            session, "thinking_level", effective_thinking
+        )
     scope = persist_defaults(updates) if persist_defaults else "default"
     append_history(
         f"{cyan('Model:')} {selected_model_id} ({normalized_provider}, {strength}, thinking {updates.get('defaultThinkingLevel', 'off')})  "

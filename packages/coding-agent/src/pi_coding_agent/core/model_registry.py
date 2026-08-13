@@ -183,6 +183,16 @@ class ProviderConfig:
     auth_header: bool = False
     models: list[dict[str, Any]] = field(default_factory=list)
     model_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
+    tiers: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+def _tier_declares_reasoning(tiers: dict[str, Any], model_id: str) -> bool:
+    return any(
+        isinstance(tier, dict)
+        and tier.get("model") == model_id
+        and str(tier.get("thinkingLevel") or "off").lower() != "off"
+        for tier in tiers.values()
+    )
 
 
 class ModelRegistry:
@@ -357,6 +367,7 @@ class ModelRegistry:
                 auth_header=prov_cfg.get("authHeader", False),
                 models=prov_cfg.get("models") or [],
                 model_overrides=prov_cfg.get("modelOverrides") or {},
+                tiers=prov_cfg.get("tiers") or {},
             )
 
             # Provider-level overrides for built-in models
@@ -398,7 +409,12 @@ class ModelRegistry:
                         name=model_def.get("name") or model_def["id"],
                         api=api,
                         provider=provider_name,
-                        reasoning=model_def.get("reasoning", False),
+                        reasoning=model_def.get(
+                            "reasoning",
+                            _tier_declares_reasoning(
+                                prov_cfg.get("tiers") or {}, model_def["id"]
+                            ),
+                        ),
                         input=model_def.get("input", ["text"]),
                         cost=model_def.get("cost") or default_cost,
                         context_window=model_def.get("contextWindow", 128000),
@@ -435,7 +451,10 @@ class ModelRegistry:
                     name=model_def.get("name") or model_def["id"],
                     api=api,
                     provider=provider_name,
-                    reasoning=model_def.get("reasoning", False),
+                    reasoning=model_def.get(
+                        "reasoning",
+                        _tier_declares_reasoning(prov_config.tiers, model_def["id"]),
+                    ),
                     input=model_def.get("input", ["text"]),
                     cost=model_def.get("cost") or default_cost,
                     context_window=model_def.get("contextWindow", 128000),
@@ -636,6 +655,7 @@ class ModelRegistry:
             auth_header=config.get("authHeader", False),
             models=config.get("models") or [],
             model_overrides=config.get("modelOverrides") or {},
+            tiers=config.get("tiers") or {},
         )
         self._registered_providers[name] = prov
 
@@ -762,7 +782,10 @@ class ModelRegistry:
             provider=provider,
             base_url=config.base_url,
             headers=config.headers,
-            reasoning=config.api in {"openai-responses", "anthropic-messages"},
+            reasoning=(
+                config.api in {"openai-responses", "anthropic-messages"}
+                or _tier_declares_reasoning(config.tiers, model_id)
+            ),
             input=["text", "image"],
             cost={"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
             context_window=128000,

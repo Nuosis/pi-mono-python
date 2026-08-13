@@ -68,7 +68,13 @@ from .trust_manager import ProjectTrustDecision, ProjectTrustStore
 
 # ── Thinking levels (mirrors TS constants) ────────────────────────────────────
 _THINKING_LEVELS: list[ThinkingLevel] = ["off", "minimal", "low", "medium", "high"]
-_THINKING_LEVELS_WITH_XHIGH: list[ThinkingLevel] = ["off", "minimal", "low", "medium", "high", "xhigh"]
+_THINKING_LEVELS_WITH_XHIGH: list[ThinkingLevel] = [*_THINKING_LEVELS, "xhigh"]
+_THINKING_LEVELS_WITH_ADAPTIVE: list[ThinkingLevel] = [*_THINKING_LEVELS, "adaptive"]
+_THINKING_LEVELS_WITH_XHIGH_AND_ADAPTIVE: list[ThinkingLevel] = [
+    *_THINKING_LEVELS,
+    "xhigh",
+    "adaptive",
+]
 
 # ── Retry error pattern (mirrors TS _isRetryableError regex) ─────────────────
 _RETRY_PATTERN = re.compile(
@@ -1558,10 +1564,17 @@ class AgentSession:
 
     def get_available_thinking_levels(self) -> list[ThinkingLevel]:
         """Get thinking levels available for current model."""
-        from pi_ai import supports_xhigh
+        from pi_ai import supports_adaptive, supports_xhigh
+
         model = self._agent.state.model
-        if model and supports_xhigh(model):
+        has_xhigh = bool(model and supports_xhigh(model))
+        has_adaptive = supports_adaptive(model)
+        if has_xhigh and has_adaptive:
+            return list(_THINKING_LEVELS_WITH_XHIGH_AND_ADAPTIVE)
+        if has_xhigh:
             return list(_THINKING_LEVELS_WITH_XHIGH)
+        if has_adaptive:
+            return list(_THINKING_LEVELS_WITH_ADAPTIVE)
         return list(_THINKING_LEVELS)
 
     def supports_thinking(self) -> bool:

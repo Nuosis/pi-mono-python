@@ -442,6 +442,46 @@ class TestAnthropicProviderResponseInstrumentation:
         assert callback_model.provider == "minimax"
 
     @pytest.mark.asyncio
+    async def test_claude_4_6_adaptive_level_reaches_provider_payload(self):
+        from pi_ai.providers import anthropic as anthropic_provider
+        from pi_ai.types import SimpleStreamOptions
+
+        stream = self.FakeAnthropicStream(
+            self.RawProviderEvent(),
+            self._final_message(),
+        )
+        captured = {}
+
+        def start_stream(**kwargs):
+            captured.update(kwargs)
+            return self.FakeStreamContext(stream)
+
+        client = SimpleNamespace(
+            messages=SimpleNamespace(stream=start_stream)
+        )
+        with patch(
+            "pi_ai.providers.anthropic._build_client",
+            return_value=(client, False),
+        ):
+            events = [
+                event
+                async for event in anthropic_provider.stream_simple(
+                    _make_model(
+                        id_="claude-sonnet-4-6",
+                        provider="anthropic",
+                        api="anthropic-messages",
+                        reasoning=True,
+                    ),
+                    _make_context(),
+                    SimpleStreamOptions(api_key="test-key", reasoning="adaptive"),
+                )
+            ]
+
+        assert events[-1].type == "done"
+        assert captured["thinking"] == {"type": "adaptive"}
+        assert captured["output_config"] == {"effort": "high"}
+
+    @pytest.mark.asyncio
     async def test_anthropic_emits_partial_raw_response_when_stream_fails(self):
         from pi_ai.providers import anthropic as anthropic_provider
         from pi_ai.types import SimpleStreamOptions
@@ -610,6 +650,50 @@ class TestOpenAIResponsesParams:
             "function": {"name": "sms.notify_staff_owner"},
         }
         assert request["parallel_tool_calls"] is False
+
+    @pytest.mark.asyncio
+    async def test_openrouter_gpt_5_6_sends_xhigh_reasoning_effort(self):
+        from pi_ai.providers.openai_completions import stream_simple
+        from pi_ai.types import Context, SimpleStreamOptions
+
+        class EmptyStream:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+        create = AsyncMock(return_value=EmptyStream())
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        with patch(
+            "pi_ai.providers.openai_completions._openai.AsyncOpenAI",
+            return_value=client,
+        ):
+            events = [
+                event
+                async for event in stream_simple(
+                    _make_model(
+                        id_="gpt-5.6-luna",
+                        provider="openrouter",
+                        api="openai-completions",
+                        reasoning=True,
+                    ),
+                    Context(),
+                    SimpleStreamOptions(api_key="test-key", reasoning="xhigh"),
+                )
+            ]
+
+        assert events[0].type == "start"
+        assert create.await_args.kwargs["reasoning_effort"] == "xhigh"
 
     def test_openai_codex_responses_body_always_sends_instructions(self):
         from pi_ai import Context

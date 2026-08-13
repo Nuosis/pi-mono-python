@@ -66,7 +66,7 @@ class SettingsSelectorComponent:
             SettingItem("quiet-startup", "Quiet startup", "Disable verbose startup printing", bool_value("quietStartup", bool(self._cfg("quiet_startup", False))), ["true", "false"]),
             SettingItem("double-escape-action", "Double-escape action", "Action for double escape", str(self._cfg("doubleEscapeAction", self._cfg("double_escape_action", "tree"))), ["tree", "fork", "none"]),
             SettingItem("tree-filter-mode", "Tree filter mode", "Default tree filter", str(self._cfg("treeFilterMode", self._cfg("tree_filter_mode", "default"))), ["default", "no-tools", "user-only", "labeled-only", "all"]),
-            SettingItem("thinking", "Thinking level", "Reasoning depth", str(self._cfg("thinkingLevel", self._cfg("thinking_level", "medium"))), list(self._cfg("availableThinkingLevels", ["off", "minimal", "low", "medium", "high", "xhigh"]))),
+            SettingItem("thinking", "Thinking level", "Reasoning depth", str(self._cfg("thinkingLevel", self._cfg("thinking_level", "medium"))), list(self._cfg("availableThinkingLevels", ["off", "minimal", "low", "medium", "high", "xhigh", "adaptive"]))),
             SettingItem("theme", "Theme", "Color theme", str(self._cfg("currentTheme", self._cfg("theme", "dark"))), list(self._cfg("availableThemes", ["dark", "light"]))),
         ]
         if bool(self._cfg("supportsImages", self._cfg("showImagesSupported", False))):

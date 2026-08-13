@@ -534,6 +534,33 @@ class TestThinkingLevelCycling:
         assert "off" in levels
         assert isinstance(levels, list)
 
+    def test_gpt_5_6_cycles_from_high_to_xhigh(self, agent_session):
+        from pi_ai.types import Model, ModelCost
+
+        agent_session._agent.set_model(Model(
+            id="gpt-5.6-luna",
+            name="GPT-5.6 Luna",
+            api="openai-completions",
+            provider="openrouter",
+            reasoning=True,
+            base_url="https://openrouter.ai/api/v1",
+            cost=ModelCost(),
+            context_window=1_050_000,
+            max_tokens=128_000,
+        ))
+
+        agent_session._agent.set_thinking_level("high")
+
+        assert agent_session.cycle_thinking_level() == "xhigh"
+        assert agent_session.thinking_level == "xhigh"
+
+    def test_claude_4_6_cycles_from_high_to_adaptive(self, agent_session):
+        agent_session._agent.set_model(get_model("anthropic", "claude-sonnet-4-6"))
+        agent_session._agent.set_thinking_level("high")
+
+        assert agent_session.cycle_thinking_level() == "adaptive"
+        assert agent_session.thinking_level == "adaptive"
+
     def test_cycle_thinking_level_advances(self, agent_session, monkeypatch):
         monkeypatch.setattr(
             agent_session, "get_available_thinking_levels",

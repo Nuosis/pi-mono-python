@@ -14,7 +14,7 @@ from pi_coding_agent.config import APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, ENV
 
 Mode = Literal["text", "json", "rpc"]
 
-VALID_THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh")
+VALID_THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "adaptive")
 
 
 def is_valid_thinking_level(level: str) -> bool:

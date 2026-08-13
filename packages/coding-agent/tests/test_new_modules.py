@@ -707,6 +707,43 @@ class TestModelRegistryExtended:
         assert model.base_url == "https://api.minimax.example/v1"
         assert registry.get_api_key("minimax") == "secret-key"
 
+    def test_tier_thinking_marks_synthesized_compatible_model_as_reasoning(self, tmp_path):
+        import json
+
+        from pi_coding_agent.core.auth_storage import AuthStorage
+        from pi_coding_agent.core.model_registry import ModelRegistry
+
+        models_path = tmp_path / "models.json"
+        models_path.write_text(
+            json.dumps(
+                {
+                    "providers": {
+                        "openrouter": {
+                            "name": "OpenRouter",
+                            "api": "openai-completions",
+                            "baseUrl": "https://openrouter.ai/api/v1",
+                            "models": [],
+                            "tiers": {
+                                "standard": {
+                                    "model": "gpt-5.6-luna",
+                                    "thinkingLevel": "xhigh",
+                                }
+                            },
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        auth = AuthStorage.in_memory({"openrouter": {"type": "api_key", "key": "secret-key"}})
+
+        model = ModelRegistry(auth_storage=auth, models_json_path=str(models_path)).find(
+            "openrouter", "gpt-5.6-luna"
+        )
+
+        assert model is not None
+        assert model.reasoning is True
+
     def test_configured_provider_explicit_model_metadata_beats_synthetic_fallback(self, tmp_path):
         import json
 
@@ -1195,6 +1232,165 @@ async def test_tui_model_command_compatible_template_uses_configured_provider(tm
         "defaultModel": "MiniMax-M3",
         "defaultThinkingLevel": "adaptive",
     }]
+
+
+@pytest.mark.asyncio
+async def test_tui_model_command_applies_openrouter_xhigh_to_live_session(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from pi_ai import get_model
+    from pi_coding_agent.core.agent_session import AgentSession
+    from pi_coding_agent.core.auth_storage import AuthStorage
+    from pi_coding_agent.core.model_registry import ModelRegistry
+    from pi_coding_agent.core.session_manager import SessionManager
+    from pi_coding_agent.core.settings_manager import Settings
+    from pi_coding_agent.modes.interactive.tui import _handle_model_command
+
+    models_path = tmp_path / "models.json"
+    models_path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "openrouter": {
+                        "name": "OpenRouter",
+                        "api": "openai-completions",
+                        "baseUrl": "https://openrouter.ai/api/v1",
+                        "models": [],
+                        "tiers": {
+                            "standard": {
+                                "model": "gpt-5.6-luna",
+                                "thinkingLevel": "xhigh",
+                            }
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("pi_coding_agent.config.get_models_path", lambda: str(models_path))
+    auth = AuthStorage.in_memory({})
+    auth.set_api_key("openrouter", "secret-key")
+    registry = ModelRegistry(auth_storage=auth, models_json_path=str(models_path))
+    session = AgentSession(
+        cwd=str(tmp_path),
+        model=get_model("openai", "gpt-5.4-nano"),
+        settings=Settings(auto_compact=False, thinking_level="high"),
+        session_manager=SessionManager.create(
+            cwd=str(tmp_path), session_dir=str(tmp_path / "sessions")
+        ),
+        auth_storage=auth,
+        model_registry=registry,
+        initial_active_tool_names=[],
+    )
+
+    async def show_select(title, options, opts=None):
+        return {
+            "Provider": "OpenAI Compatible",
+            "Model strength": "standard",
+            "Configured provider": "OpenRouter",
+        }[title]
+
+    history = []
+    persisted = []
+    await _handle_model_command(
+        "/model",
+        session,
+        history.append,
+        lambda: None,
+        SimpleNamespace(request_render=lambda: None),
+        lambda text: text,
+        lambda text: text,
+        lambda text: text,
+        lambda text: text,
+        lambda text: text,
+        lambda updates: persisted.append(updates) or "this agent",
+        show_select,
+    )
+
+    assert session.model.provider == "openrouter"
+    assert session.model.id == "gpt-5.6-luna"
+    assert session.model.reasoning is True
+    assert session.thinking_level == "xhigh"
+    assert persisted == [{
+        "defaultProvider": "openrouter",
+        "defaultModel": "gpt-5.6-luna",
+        "defaultThinkingLevel": "xhigh",
+    }]
+    assert "thinking xhigh" in history[-1]
+
+
+@pytest.mark.asyncio
+async def test_model_confirmation_persists_effective_clamped_thinking(tmp_path, monkeypatch):
+    import json
+
+    from pi_ai import get_model
+    from pi_coding_agent.core.agent_session import AgentSession
+    from pi_coding_agent.core.auth_storage import AuthStorage
+    from pi_coding_agent.core.model_registry import ModelRegistry
+    from pi_coding_agent.core.session_manager import SessionManager
+    from pi_coding_agent.core.settings_manager import Settings
+    from pi_coding_agent.modes.interactive.tui import _apply_profile_model
+
+    models_path = tmp_path / "models.json"
+    models_path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "compatible": {
+                        "name": "Compatible",
+                        "api": "openai-completions",
+                        "baseUrl": "https://compatible.example/v1",
+                        "models": [{"id": "non-reasoning", "reasoning": False}],
+                        "tiers": {
+                            "standard": {
+                                "model": "non-reasoning",
+                                "thinkingLevel": "xhigh",
+                            }
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("pi_coding_agent.config.get_models_path", lambda: str(models_path))
+    auth = AuthStorage.in_memory({})
+    auth.set_api_key("compatible", "secret-key")
+    registry = ModelRegistry(auth_storage=auth, models_json_path=str(models_path))
+    session = AgentSession(
+        cwd=str(tmp_path),
+        model=get_model("openai", "gpt-5.4-nano"),
+        settings=Settings(auto_compact=False, thinking_level="high"),
+        session_manager=SessionManager.create(
+            cwd=str(tmp_path), session_dir=str(tmp_path / "sessions")
+        ),
+        auth_storage=auth,
+        model_registry=registry,
+        initial_active_tool_names=[],
+    )
+    history = []
+    persisted = []
+
+    await _apply_profile_model(
+        session,
+        "compatible",
+        "standard",
+        None,
+        history.append,
+        lambda: None,
+        None,
+        lambda text: text,
+        lambda text: text,
+        lambda text: text,
+        lambda text: text,
+        lambda updates: persisted.append(updates) or "this agent",
+    )
+
+    assert session.thinking_level == "high"
+    assert persisted[-1]["defaultThinkingLevel"] == "high"
+    assert "thinking high" in history[-1]
 
 
 @pytest.mark.asyncio

@@ -80,7 +80,7 @@ class Settings:
     name: str | None = None
     default_provider: str | None = None
     default_model: str | None = None
-    default_thinking_level: str | None = None  # off|minimal|low|medium|high|xhigh
+    default_thinking_level: str | None = None  # off|minimal|low|medium|high|xhigh|adaptive
     transport: str | None = None               # "sse" | "websocket"
     steering_mode: str | None = "one-at-a-time"  # "all" | "one-at-a-time"
     follow_up_mode: str | None = "one-at-a-time"  # "all" | "one-at-a-time"

@@ -215,3 +215,61 @@ while retaining the exact registered callback URI.
   “Authorization complete,” Tau reported “Subscription login stored for
   OpenAI,” and an encrypted-auth readback confirmed a current OpenAI Codex
   credential with access token, refresh token, account ID, and future expiry.
+
+---
+
+## OpenRouter thinking level mismatch — 2026-08-12
+
+### Problem
+
+In the Interviewer agent, `/model` selecting OpenRouter, `standard`, and
+`gpt-5.6-luna` reports that `xhigh` was applied, but the live footer and saved
+agent setting show `high`. The `/thinking` cycle also omits `xhigh` for GPT-5.6
+and omits `adaptive` for models that use adaptive thinking.
+
+### Observable success
+
+The existing OpenRouter tier configuration resolves `gpt-5.6-luna` as a
+reasoning model, model selection leaves the live session at `xhigh`, and the
+confirmation and persisted default report the effective level. `/thinking`
+offers `xhigh` for GPT-5.6 and `adaptive` for Claude 4.6 adaptive-thinking
+models.
+
+### Hypothesis list
+
+| # | Hypothesis | Null hypothesis | Status |
+|---|------------|-----------------|--------|
+| 1 | The saved tier does not contain `xhigh` | The active models file stores OpenRouter standard with `thinkingLevel: xhigh` | NULLIFIED by `~/.tau/agent/models.json` readback |
+| 2 | The OpenRouter model resolves as non-reasoning and clamps `xhigh` | The runtime registry resolves `openrouter/gpt-5.6-luna` with `reasoning=True` | CONFIRMED; repaired by tier-derived reasoning capability |
+| 3 | The confirmation reads the live effective thinking state | The confirmation uses `session.thinking_level` after applying the requested level | CONFIRMED; repaired to read back live session state |
+| 4 | GPT-5.6 and adaptive Claude models are represented in `/thinking` capability checks | The capability helpers recognize GPT-5.6 `xhigh` and Claude 4.6 adaptive thinking | CONFIRMED; repaired capability lists and cycling |
+| 5 | The OpenAI-compatible adapter preserves `xhigh` in the provider request | The outbound OpenRouter payload contains `reasoning_effort: xhigh` | CONFIRMED; original payload regression observed `high`, repaired payload and live request observed `xhigh` |
+
+### Debug evidence
+
+The active `~/.tau/agent/models.json` contains OpenRouter standard mapped to
+`gpt-5.6-luna` with `thinkingLevel: xhigh`, while a registry instantiated in
+the Interviewer environment resolves that exact model as
+`api=openai-completions, reasoning=False`. The active Interviewer setting is
+therefore `defaultThinkingLevel: high` even though the tier remains `xhigh`.
+
+### Root cause and repair evidence
+
+The compatible-provider registry discards the tier's reasoning declaration
+when its `models` array is empty. Independently, GPT-5.6 is absent from the
+`supports_xhigh` capability check, adaptive Claude models have no selectable
+adaptive level, and the TUI confirmation reports the requested rather than
+effective state. The OpenAI-compatible adapter also unconditionally downgrades
+`xhigh` to `high` in its outbound payload.
+
+The focused source slice passes 34 tests covering model capabilities, registry
+resolution, `/thinking` cycling, model selection, effective-state persistence,
+and OpenAI-compatible request construction. An isolated composed run using the
+real `~/.tau/agent/models.json` and encrypted OpenRouter credential resolved
+`openrouter/gpt-5.6-luna` as reasoning-capable and applied/persisted `xhigh`.
+Finally, the public PyPI `0.56.33` wheel was installed into a clean environment
+without a local `direct_url`, then sent a live OpenRouter request with
+`reasoning_effort: xhigh`; OpenRouter returned exactly `OK`, stop reason `stop`,
+no error, and 16 total tokens. Interviewer was pinned, locked, and synced to
+that same public `0.56.33` build, and its literal `tau update` route resolved
+`tau-by-clarity==0.56.33`.

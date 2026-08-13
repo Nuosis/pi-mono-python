@@ -46,7 +46,7 @@ DEFAULT_MODEL_PER_PROVIDER: dict[str, str] = {
     "kimi-coding": "kimi-k2-thinking",
 }
 
-_VALID_THINKING_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "off"}
+_VALID_THINKING_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "adaptive", "off"}
 
 import re as _re
 _DATE_PATTERN = _re.compile(r"-\d{8}$")

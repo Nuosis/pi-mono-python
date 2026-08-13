@@ -51,11 +51,22 @@ def calculate_cost(model: Model, usage: Usage) -> float:
 
 def supports_xhigh(model: Model) -> bool:
     """Check if a model supports xhigh reasoning."""
-    if "gpt-5.5" in model.id or "gpt-5.4" in model.id or "gpt-5.2" in model.id:
+    if any(version in model.id for version in ("gpt-5.6", "gpt-5.5", "gpt-5.4", "gpt-5.2")):
         return True
     if model.api == "anthropic-messages":
         return "opus-4-6" in model.id or "opus-4.6" in model.id
     return False
+
+
+def supports_adaptive(model: Model | None) -> bool:
+    """Check if a model exposes Anthropic adaptive thinking."""
+    if model is None or model.api != "anthropic-messages":
+        return False
+    model_id = model.id.lower()
+    return any(
+        family in model_id
+        for family in ("opus-4-6", "opus-4.6", "sonnet-4-6", "sonnet-4.6")
+    )
 
 
 def models_are_equal(a: Model | None, b: Model | None) -> bool:

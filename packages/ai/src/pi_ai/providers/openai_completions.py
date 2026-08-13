@@ -10,6 +10,7 @@ from typing import Any
 
 import openai as _openai
 
+from ..models import supports_xhigh
 from ..types import (
     AssistantMessage,
     AssistantMessageEvent,
@@ -193,7 +194,11 @@ async def stream_simple(
 
     if opts.reasoning:
         effort_map = {"minimal": "low", "low": "low", "medium": "medium", "high": "high", "xhigh": "high"}
-        params["reasoning_effort"] = effort_map.get(opts.reasoning, "medium")
+        params["reasoning_effort"] = (
+            "xhigh"
+            if opts.reasoning == "xhigh" and supports_xhigh(model)
+            else effort_map.get(opts.reasoning, "medium")
+        )
 
     params = await apply_on_payload(params, model, opts.get("on_payload"))
 

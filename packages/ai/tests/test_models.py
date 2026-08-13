@@ -1,7 +1,15 @@
 """Tests for model registry — mirrors packages/ai/test/ model tests."""
 import pytest
 
-from pi_ai import get_model, get_models, get_providers, calculate_cost, supports_xhigh, Usage
+from pi_ai import (
+    Usage,
+    calculate_cost,
+    get_model,
+    get_models,
+    get_providers,
+    supports_adaptive,
+    supports_xhigh,
+)
 
 
 def test_get_model_anthropic():
@@ -116,3 +124,27 @@ def test_supports_xhigh_true():
         max_tokens=32768,
     )
     assert supports_xhigh(model) is True
+
+
+def test_supports_xhigh_for_gpt_5_6_compatible_model():
+    from pi_ai.types import Model, ModelCost
+
+    model = Model(
+        id="gpt-5.6-luna",
+        name="GPT-5.6 Luna",
+        api="openai-completions",
+        provider="openrouter",
+        reasoning=True,
+        base_url="https://openrouter.ai/api/v1",
+        cost=ModelCost(),
+        context_window=1_050_000,
+        max_tokens=128_000,
+    )
+
+    assert supports_xhigh(model) is True
+
+
+def test_supports_adaptive_for_claude_4_6_models_only():
+    assert supports_adaptive(get_model("anthropic", "claude-opus-4-6")) is True
+    assert supports_adaptive(get_model("anthropic", "claude-sonnet-4-6")) is True
+    assert supports_adaptive(get_model("anthropic", "claude-3-5-sonnet-20241022")) is False

@@ -29,7 +29,7 @@ def prompt_cmd(
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Model ID to use"),
     provider: Optional[str] = typer.Option(None, "--provider", "-p", help="Provider name"),
     cwd: Optional[str] = typer.Option(None, "--cwd", help="Working directory"),
-    thinking: str = typer.Option("off", "--thinking", help="Thinking level: off/minimal/low/medium/high"),
+    thinking: str = typer.Option("off", "--thinking", help="Thinking level: off/minimal/low/medium/high/xhigh/adaptive"),
     json_out: bool = typer.Option(False, "--json", help="Output as JSON"),
     show_thinking: bool = typer.Option(False, "--show-thinking", help="Show thinking blocks"),
 ) -> None:
