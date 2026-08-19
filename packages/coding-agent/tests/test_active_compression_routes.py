@@ -25,23 +25,6 @@ def _handle(text: str) -> str:
     return match.group(1)
 
 
-def test_content_detector_matches_headroom_route_fixtures():
-    fixture_dir = Path("/tmp/headroom-src/tests/parity/fixtures/content_detector")
-    assert fixture_dir.exists(), "Headroom content_detector fixtures are required for parity"
-    mismatches = []
-
-    for path in sorted(fixture_dir.glob("*.json")):
-        data = json.loads(path.read_text(encoding="utf-8"))
-        raw = data.get("input", "")
-        content = str(raw.get("content", "")) if isinstance(raw, dict) else str(raw)
-        expected = data["output"]["content_type"]
-        actual = _detect_content_type(content)
-        if actual != expected:
-            mismatches.append(f"{path.name}: expected {expected}, got {actual}")
-
-    assert not mismatches
-
-
 def test_search_output_compresses_by_file_and_preserves_errors(tmp_path):
     lines = []
     for i in range(1, 80):

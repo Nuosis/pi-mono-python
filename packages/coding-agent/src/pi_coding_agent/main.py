@@ -5,6 +5,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import tomllib
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,66 @@ def _find_local_project_root(cwd: str) -> str | None:
     return None
 
 
+def _locked_tau_version(project_root: str) -> str | None:
+    lockfile = Path(project_root) / "uv.lock"
+    try:
+        data = tomllib.loads(lockfile.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    packages = data.get("package", [])
+    if not isinstance(packages, list):
+        return None
+    for package in packages:
+        if not isinstance(package, dict) or package.get("name") != "tau-by-clarity":
+            continue
+        version = package.get("version")
+        return str(version) if version else None
+    return None
+
+
+def _update_local_project_tau(project_root: str, args: Sequence[str], env: dict[str, str]) -> int:
+    update_result = subprocess.run(
+        [
+            "uv",
+            "add",
+            "--project",
+            project_root,
+            "--upgrade-package",
+            "tau-by-clarity",
+            "tau-by-clarity>=0",
+            *args,
+        ],
+        env=env,
+    )
+    if update_result.returncode != 0:
+        return update_result.returncode
+
+    version = _locked_tau_version(project_root)
+    if not version:
+        print("Unable to determine resolved tau-by-clarity version from uv.lock.", file=sys.stderr)
+        return 1
+
+    pin_result = subprocess.run(
+        [
+            "uv",
+            "add",
+            "--project",
+            project_root,
+            f"tau-by-clarity=={version}",
+            *args,
+        ],
+        env=env,
+    )
+    if pin_result.returncode != 0:
+        return pin_result.returncode
+
+    sync_result = subprocess.run(
+        ["uv", "sync", "--project", project_root],
+        env=env,
+    )
+    return sync_result.returncode
+
+
 def _dispatch_to_local_project(args: Sequence[str], cwd: str) -> None:
     """Re-exec into the project-pinned tau-by-clarity when launched globally.
 
@@ -76,32 +137,15 @@ def _dispatch_to_local_project(args: Sequence[str], cwd: str) -> None:
         return
     if "--init" in args:
         return
+    if args and args[0] == "memory":
+        return
     project_root = _find_local_project_root(cwd)
     if not project_root:
         return
     env = os.environ.copy()
     env[_LOCAL_DISPATCH_ENV] = "1"
     if args and args[0] == "update":
-        update_result = subprocess.run(
-            [
-                "uv",
-                "add",
-                "--project",
-                project_root,
-                "--upgrade-package",
-                "tau-by-clarity",
-                "tau-by-clarity",
-                *args[1:],
-            ],
-            env=env,
-        )
-        if update_result.returncode != 0:
-            raise SystemExit(update_result.returncode)
-        sync_result = subprocess.run(
-            ["uv", "sync", "--project", project_root],
-            env=env,
-        )
-        raise SystemExit(sync_result.returncode)
+        raise SystemExit(_update_local_project_tau(project_root, args[1:], env))
     os.execvpe(
         "uv",
         ["uv", "run", "--project", project_root, "python", "-m", "pi_coding_agent.main", *args],
@@ -698,6 +742,122 @@ def _print_package_help(command: str) -> None:
         print(f"Usage:\n  {usage}\n\nList installed packages from user and project settings.\n")
 
 
+def _parse_memory_command(args: Sequence[str]) -> dict[str, Any] | None:
+    if len(args) < 2 or args[0] != "memory":
+        return None
+    subcommand = args[1]
+    if subcommand not in {"dream"}:
+        return {
+            "command": subcommand,
+            "invalid_command": True,
+            "help": False,
+        }
+    parsed: dict[str, Any] = {
+        "command": subcommand,
+        "dry_run": True,
+        "since": None,
+        "json": False,
+        "help": False,
+        "invalid_command": False,
+        "invalid_option": None,
+        "missing_option_value": None,
+        "conflicting_options": None,
+    }
+    explicit_dry_run = False
+    explicit_apply = False
+    index = 2
+    while index < len(args):
+        arg = args[index]
+        if arg in {"-h", "--help"}:
+            parsed["help"] = True
+        elif arg == "--dry-run":
+            explicit_dry_run = True
+            parsed["dry_run"] = True
+        elif arg == "--apply":
+            explicit_apply = True
+            parsed["dry_run"] = False
+        elif arg == "--json":
+            parsed["json"] = True
+        elif arg == "--since":
+            value = args[index + 1] if index + 1 < len(args) else None
+            if not value or value.startswith("-"):
+                parsed["missing_option_value"] = arg
+            else:
+                parsed["since"] = value
+                index += 1
+        elif arg.startswith("-"):
+            parsed["invalid_option"] = parsed["invalid_option"] or arg
+        else:
+            parsed["invalid_option"] = parsed["invalid_option"] or arg
+        index += 1
+    if explicit_dry_run and explicit_apply:
+        parsed["conflicting_options"] = "--dry-run cannot be combined with --apply"
+    return parsed
+
+
+def _memory_usage() -> str:
+    return f"{APP_NAME} memory dream [--dry-run|--apply] [--since <iso|epoch>] [--json]"
+
+
+def _print_memory_help() -> None:
+    print(
+        "Usage:\n"
+        f"  {_memory_usage()}\n\n"
+        "Consolidate conversation memory into durable semantic memory. Dry-run is the default.\n"
+    )
+
+
+def _handle_memory_command(args: Sequence[str]) -> tuple[bool, int]:
+    parsed = _parse_memory_command(args)
+    if not parsed:
+        return False, 0
+    if parsed.get("help"):
+        _print_memory_help()
+        return True, 0
+    if parsed.get("invalid_command"):
+        print(f'Unknown memory command "{parsed["command"]}".', file=sys.stderr)
+        print(f"Usage: {_memory_usage()}", file=sys.stderr)
+        return True, 1
+    if parsed.get("invalid_option"):
+        print(f'Unknown option {parsed["invalid_option"]} for "memory dream".', file=sys.stderr)
+        print(f"Usage: {_memory_usage()}", file=sys.stderr)
+        return True, 1
+    if parsed.get("missing_option_value"):
+        print(f'Missing value for {parsed["missing_option_value"]}.', file=sys.stderr)
+        print(f"Usage: {_memory_usage()}", file=sys.stderr)
+        return True, 1
+    if parsed.get("conflicting_options"):
+        print(parsed["conflicting_options"], file=sys.stderr)
+        print(f"Usage: {_memory_usage()}", file=sys.stderr)
+        return True, 1
+
+    from .core.memory.dream import dream_memory, parse_since
+
+    try:
+        since = parse_since(parsed.get("since"))
+    except ValueError as exc:
+        print(f"Invalid --since value: {exc}", file=sys.stderr)
+        return True, 1
+
+    result = dream_memory(os.getcwd(), dry_run=parsed["dry_run"], since=since)
+    if parsed["json"]:
+        import json
+
+        print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+        return True, 0
+
+    mode = "dry-run" if result.dry_run else "apply"
+    print(f"memory dream ({mode})")
+    print(f"conversation rows scanned: {result.conversation_rows_scanned}")
+    print(f"proposals: {len(result.proposals)}")
+    print(f"written: {len(result.written_ids)}")
+    print(f"skipped existing: {len(result.skipped_existing)}")
+    if result.proposals:
+        for proposal in result.proposals:
+            print(f"- [{proposal.memory_type}] {proposal.title} ({proposal.status})")
+    return True, 0
+
+
 async def _handle_package_command(args: Sequence[str]) -> tuple[bool, int]:
     parsed = _parse_package_command(args)
     if not parsed:
@@ -847,6 +1007,10 @@ async def _run(args: Sequence[str]) -> int:
     handled, exit_code = await _handle_package_command(args)
     if handled:
         log_event("package_command_handled", exit_code=exit_code)
+        return exit_code
+    handled, exit_code = _handle_memory_command(args)
+    if handled:
+        log_event("memory_command_handled", exit_code=exit_code)
         return exit_code
     handled, exit_code = await _handle_config_command(args)
     if handled:
@@ -1075,6 +1239,12 @@ async def _run(args: Sequence[str]) -> int:
     session = result.session
     event_unsub = attach_session_event_logging(session)
     log_session_snapshot("created", session)
+    # CLI `--goal <text>` seeds the in-memory session goal. No disk write;
+    # the goal tools (when explicitly opted in via settings.json's tools list)
+    # remain the only path to mutate the goal thereafter.
+    if getattr(parsed, "goal", None):
+        session.set_current_goal(parsed.goal)
+        log_event("goal_seeded_from_cli", session_id=session.session_id)
     if parsed.name:
         session.session_manager.append_session_info(parsed.name)
         log_event("session_named", name=parsed.name)

@@ -36,6 +36,41 @@ from .auth_storage import AuthStorage
 from .compaction import compact_context, should_compact
 
 
+@dataclasses.dataclass
+class SessionGoal:
+    """In-memory session goal state. Lives on AgentSession; never persisted.
+
+    `status` transitions:
+      - "active"   — current; the agent continues working toward it
+      - "complete" — terminal; signals the agent loop to stop
+      - "blocked"  — terminal; signals the agent loop to stop
+    """
+
+    objective: str
+    status: str = "active"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in ("complete", "blocked")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"objective": self.objective, "status": self.status}
+
+
+def _goal_tool_matches(name: str) -> bool:
+    """True if `name` opts a goal tool into the active set."""
+    if name in _GOAL_TOOL_NAMES_SET or name == _GOAL_ALIAS:
+        return True
+    return False
+
+
+_GOAL_TOOL_NAMES_SET: frozenset[str] = frozenset(
+    {"get_goal", "set_goal", "update_goal", "clear_goal"}
+)
+_GOAL_ALIAS = "goal"
+_GOAL_TERMINAL_STATUSES = frozenset({"complete", "blocked"})
+
+
 def _active_compression_on() -> bool:
     """True when active compression (Headroom/CCR) is enabled — in which case
     proactive summarization compaction stands down (it's the fallback)."""
@@ -122,7 +157,14 @@ class AgentSession:
         self._extension_bindings: dict[str, Any] = {}
         self._steering_mode_override: str | None = None
         self._follow_up_mode_override: str | None = None
-        self._current_goal = self._initial_goal_from_settings()
+        self._goal_terminated: bool = False
+        self._goal: SessionGoal | None = None
+        self._initial_active_tool_names: list[str] | None = (
+            list(initial_active_tool_names)
+            if initial_active_tool_names is not None
+            else None
+        )
+        self._current_goal = self._initial_goal_from_session_vars()
 
         if session_manager is not None:
             self._session_manager = session_manager
@@ -132,13 +174,27 @@ class AgentSession:
         self.session_id = self._session_manager.get_session_id()
         self._extension_runner = self._create_extension_runner()
 
-        # Build all tools; keep registry for set_active_tools_by_name
+        # Build all tools; keep registry for set_active_tools_by_name.
+        # Order of precedence for the default active list:
+        #   1. ctor `initial_active_tool_names` if explicitly passed
+        #   2. settings.json's `tools` list (read via self._settings_manager)
+        #   3. hardcoded ["read", "bash", "edit", "write"] as a final fallback
+        # The settings file is authoritative when ctor didn't override it.
         self._all_tools: list[AgentTool] = self._build_tools()
-        active_names = (
-            list(initial_active_tool_names)
-            if initial_active_tool_names is not None
-            else ["read", "bash", "edit", "write"]
-        )
+        if initial_active_tool_names is not None:
+            active_names = list(initial_active_tool_names)
+        else:
+            settings_obj = (
+                self._settings_manager.get()
+                if self._settings_manager is not None else None
+            )
+            settings_tools = (
+                getattr(settings_obj, "tools", None) if settings_obj is not None else None
+            )
+            if settings_tools:
+                active_names = list(settings_tools)
+            else:
+                active_names = ["read", "bash", "edit", "write"]
         active_tools = self._tools_for_names(active_names)
 
         # Resolve model
@@ -157,6 +213,7 @@ class AgentSession:
             transform_context=self._transform_context,
             on_payload=self._on_provider_payload,
             on_response=self._on_provider_response,
+            shouldStopAfterTurn=self._should_stop_after_turn,
             beforeToolCall=self._before_tool_call,
             afterToolCall=self._after_tool_call,
         )
@@ -262,6 +319,29 @@ class AgentSession:
                     scope_project=getattr(self._memory_scope, "project", None),
                     model_id=model_name,
                 )
+                try:
+                    from .memory.dream import run_scheduled_dream
+
+                    dream_result = run_scheduled_dream(memory_root)
+                    log_event(
+                        "memory.dream_checked",
+                        session_id=self.session_id,
+                        memory_root=memory_root,
+                        ran=dream_result.ran,
+                        reason=dream_result.reason,
+                        next_dream_at=dream_result.next_dream_at,
+                        written_count=(
+                            len(dream_result.dream.written_ids)
+                            if dream_result.dream is not None else 0
+                        ),
+                    )
+                except Exception as exc:
+                    try:
+                        from .cli_debug_log import log_exception
+                        log_exception("memory.dream_failed", exc,
+                                      session_id=self.session_id)
+                    except Exception:
+                        pass
         except Exception as exc:
             try:
                 from .cli_debug_log import log_exception
@@ -279,37 +359,148 @@ class AgentSession:
         self._memory_cursor = 0  # index of last message curated into memory
         self._memory_conv_cursor = 0  # index of last message appended to conversation_memory
 
-    def _initial_goal_from_settings(self) -> str | None:
+    def _initial_goal_from_session_vars(self) -> str | None:
+        """Read the goal seed from session_vars only. No disk, no settings file.
+
+        The CLI `--goal <text>` path lands in `session_vars["GOAL"]`; this is
+        where it surfaces at session construction. Goal tools (when enabled)
+        and the prompt assembly read from this same in-memory state.
+        """
         session_vars = self._settings.session_vars or {}
         goal = session_vars.get("GOAL")
         if isinstance(goal, str) and goal.strip():
-            return goal.strip()
+            value = goal.strip()
+            self._goal = SessionGoal(objective=value, status="active")
+            return value
         return None
 
+    @property
+    def goal_state(self) -> SessionGoal | None:
+        """Read-only view of the in-memory session goal. None if no goal is set."""
+        return self._goal
+
+    def _sync_goal_session_var(self) -> None:
+        """Mirror the in-memory goal into session_vars["GOAL"].
+
+        The session_vars entry is the visible side-effect that survives a
+        settings round-trip; it never touches the filesystem.
+        """
+        if self._settings.session_vars is None:
+            self._settings.session_vars = {}
+        if self._goal is not None and self._goal.status == "active":
+            self._settings.session_vars["GOAL"] = self._goal.objective
+        else:
+            self._settings.session_vars.pop("GOAL", None)
+
     def _effective_system_prompt(self) -> str:
-        if not self._current_goal:
+        # Pure in-memory read. No disk I/O.
+        goal = self._goal
+        if goal is None or goal.status != "active":
             return self._base_system_prompt
         return (
             f"{self._base_system_prompt}\n\n"
             "# Active Goal\n\n"
-            f"{self._current_goal}\n\n"
+            f"{goal.objective}\n\n"
             "Treat this as the current session goal until it is cleared or changed."
         )
 
     def set_current_goal(self, goal: str | None) -> str | None:
+        """Pure state mutation on `self._goal`. Never fires the terminator.
+
+        This method is the setter. It is used by:
+          - the CLI `--goal <text>` path (state seed at launch),
+          - the TUI `/goal <text>` path (replace the goal mid-session).
+
+        `set_current_goal(None)` is the same shape: a state mutation, not a
+        completion signal. It does NOT fire `self._goal_terminated`. The
+        rationale: the loop's continuation policy is independent of goal
+        state — sessions run without a goal, with one, or after clearing one.
+        The terminator belongs to a different verb.
+
+        To signal "the goal-phase is over; let the loop exit," callers must
+        use `clear_goal()` (which fires the terminator) or
+        `update_goal_status("complete"|"blocked")` (which fires on a
+        non-active status transition). The TUI `/goal clear` command routes
+        to `clear_goal()` for exactly this reason.
+
+        Why is CLI `--goal ""` a no-op reset but `/goal clear` exits the
+        loop? Same shape of state mutation, opposite loop consequences.
+        Because at launch there's no running loop to terminate, so the
+        asymmetry is the timing — not the user's intent to commit.
+
+        Args:
+            goal: objective string (non-empty) to set, or None/empty to
+                clear the in-memory goal without firing the terminator.
+
+        Returns:
+            The new `get_current_goal()` value (None if no active goal).
+        """
         value = (goal or "").strip()
-        self._current_goal = value or None
-        if self._settings.session_vars is None:
-            self._settings.session_vars = {}
-        if self._current_goal:
-            self._settings.session_vars["GOAL"] = self._current_goal
+        if value:
+            carry_status = (
+                self._goal.status
+                if self._goal is not None
+                and self._goal.status in ("active", "complete", "blocked")
+                else "active"
+            )
+            self._goal = SessionGoal(objective=value, status=carry_status)
         else:
-            self._settings.session_vars.pop("GOAL", None)
-        self._agent.set_system_prompt(self._effective_system_prompt())
+            self._goal = None
+        self._sync_goal_session_var()
+        self._current_goal = self.get_current_goal()
         return self._current_goal
 
+    def update_goal_status(self, status: str) -> None:
+        """Flip the goal's status. No-op if no goal is set.
+
+        Transitions to 'complete' or 'blocked' signal the agent loop to stop
+        after the current turn.
+        """
+        if status not in ("active", "complete", "blocked"):
+            raise ValueError(f"unknown goal status: {status!r}")
+        if self._goal is None:
+            return
+        old_status = self._goal.status
+        self._goal = SessionGoal(objective=self._goal.objective, status=status)
+        self._sync_goal_session_var()
+        self._current_goal = self.get_current_goal()
+        was_active = old_status == "active"
+        became_terminal = status in _GOAL_TERMINAL_STATUSES
+        if was_active and became_terminal:
+            self._mark_goal_terminated()
+
+    def clear_goal(self) -> None:
+        """Drop the goal entirely and signal the loop to stop after this turn."""
+        previous = self._goal
+        self._goal = None
+        self._sync_goal_session_var()
+        self._current_goal = None
+        if previous is not None:
+            self._mark_goal_terminated()
+
     def get_current_goal(self) -> str | None:
-        return self._current_goal
+        if self._goal is not None and self._goal.status == "active":
+            return self._goal.objective
+        return None
+
+    def _mark_goal_terminated(self) -> None:
+        """Signal that the session's goal was cleared or reached a terminal status.
+
+        Once set, the agent loop will exit at the next opportunity instead of
+        continuing autonomously toward a now-irrelevant objective.
+        """
+        self._goal_terminated = True
+
+    async def _should_stop_after_turn(self, turn_context: dict[str, Any]) -> bool:
+        # Enforcement is binary: the goal-loop machinery flips
+        # `self._goal_terminated` when a tool transitions the goal to a
+        # terminal status, and the agent loop honors that flag here.
+        # No prompt-level enforcement. No "Continue working toward..." user
+        # message. The model pursues the goal because the user told it to
+        # in their messages; the goal state on the session is what gives
+        # the loop its stopping decision.
+        del turn_context
+        return bool(self._goal_terminated)
 
     # ── Tool construction ─────────────────────────────────────────────────────
 
@@ -324,6 +515,12 @@ class AgentSession:
             create_find_tool(self.cwd),
             create_ls_tool(self.cwd),
         ]
+        # Goal tools are opt-in: register only when at least one goal tool
+        # name (or the "goal" alias) appears in the active set. Cost is zero
+        # otherwise — no create_goal_tools import, no instance creation.
+        if self._active_names_include_goal_tool():
+            from .tools import create_goal_tools
+            tools.extend(create_goal_tools(self))
         for extension_tool in self._extension_runner.get_all_registered_tools():
             try:
                 tools.append(
@@ -352,7 +549,46 @@ class AgentSession:
 
     def _tools_for_names(self, tool_names: list[str]) -> list[AgentTool]:
         tools_by_name = {tool.name: tool for tool in self._all_tools}
-        return [tools_by_name[name] for name in tool_names if name in tools_by_name]
+        selected = [tools_by_name[name] for name in tool_names if name in tools_by_name]
+        # If "goal" alias was named, expand it to the four goal tool names.
+        if _GOAL_ALIAS in tool_names:
+            for goal_name in _GOAL_TOOL_NAMES_SET:
+                tool = tools_by_name.get(goal_name)
+                if tool is not None and all(existing.name != goal_name for existing in selected):
+                    selected.append(tool)
+        return selected
+
+    def _active_names_include_goal_tool(self) -> bool:
+        """True when any of the active tool names opts a goal tool in.
+
+        Honors both the goal-alias ("goal") and explicit per-tool names.
+        Called only at construction time before the active list has been
+        finalized, so we read from the explicit requested names / settings.
+
+        Settings come from `self._settings_manager` (the disk-loaded
+        SettingsManager), NOT from `self._settings` — the latter is a
+        bare `Settings()` default-constructed by the ctor when no Settings
+        instance is passed in, and so its `tools` field is always None.
+        The manager is what reads <cwd>/.tau/settings.json and the global
+        ~/.tau/agent/settings.json.
+        """
+        names: set[str] = set()
+        initial = getattr(self, "_initial_active_tool_names", None)
+        if initial is not None:
+            names.update(initial)
+        # Settings file's `tools` list is also opt-in source when ctor
+        # didn't pass initial_active_tool_names.
+        manager_settings = (
+            self._settings_manager.get() if self._settings_manager is not None else None
+        )
+        settings_tools = (
+            getattr(manager_settings, "tools", None) if manager_settings is not None else None
+        )
+        if settings_tools:
+            names.update(settings_tools)
+        if not names:
+            return False
+        return bool(names & (_GOAL_TOOL_NAMES_SET | {_GOAL_ALIAS}))
 
     def _build_system_prompt(self, selected_tools: list[str]) -> str:
         loader = self._resource_loader
@@ -502,6 +738,8 @@ class AgentSession:
         Will be connected to ExtensionRunner.emit_context when extension support is added.
         Mirrors the transform_context callback in TypeScript SDK.
         """
+        self._session_manager.refresh_active_compression_refs()
+        messages = self._session_manager.apply_persisted_active_compression(messages)
         if self._extension_runner.has_handlers("context"):
             messages = await self._extension_runner.emit_context(messages)
         # P1: memory recall — inject a tail recall block when a store is attached.
@@ -652,7 +890,21 @@ class AgentSession:
             if msg is not None:
                 role = getattr(msg, "role", "")
                 if role in ("user", "assistant", "toolResult"):
-                    self._session_manager.append_message(_message_to_dict(msg))
+                    persisted_msg = _message_to_dict(msg)
+                    active_compression_meta = None
+                    if role == "toolResult":
+                        try:
+                            from pi_coding_agent.active_compression.persisted_context import (
+                                compress_message_for_persistence,
+                            )
+
+                            persisted_msg, active_compression_meta = compress_message_for_persistence(persisted_msg)
+                        except Exception:
+                            active_compression_meta = None
+                    self._session_manager.append_message(
+                        persisted_msg,
+                        active_compression=active_compression_meta,
+                    )
                 # Track last assistant message for retry/compaction
                 if role == "assistant":
                     self._last_assistant_msg = msg
@@ -3075,5 +3327,7 @@ def _safe_json(obj: Any) -> Any:
     except Exception:
         try:
             return str(obj)
+        except Exception:
+            return "<unserializable>"
         except Exception:
             return "<unserializable>"

@@ -70,7 +70,12 @@ def get_extension_discovery_paths(
 
     # First-class, on-by-default bundled extensions: their extension modules load
     # for every agent unless explicitly disabled (each owns its own kill-switch).
-    for _module in ("pi_coding_agent.clarity_pii", "pi_coding_agent.active_compression"):
+    # Domain/product extensions such as A2A remain opt-in through normal
+    # extension discovery or explicit agent configuration.
+    for _module in (
+        "pi_coding_agent.clarity_pii",
+        "pi_coding_agent.active_compression",
+    ):
         try:
             import importlib
 

@@ -165,6 +165,56 @@ def _output_limit(name: str, default: int) -> int:
     return max(1024, value)
 
 
+# git subcommands that open an interactive editor (vim/nano) when run without
+# a non-interactive message flag. On the agent's non-TTY stdin those block
+# forever — see session 6ba1c407 for the canonical failure mode
+# (`git rebase --continue` after a conflict resolution hung 13 minutes).
+_GIT_NONINTERACTIVE_FLAGS = frozenset({
+    "-m", "--message",
+    "-F", "--file", "--file=",
+    "--no-edit",
+})
+
+
+def _git_command_needs_editor_disabled(command: str) -> bool:
+    """Return True if `command` will spawn an interactive git editor unless
+    GIT_EDITOR (or core.editor / GIT_SEQUENCE_EDITOR) is overridden.
+
+    Triggers:
+      - `git rebase*` (any subcommand) — the rebase todo list editor, and
+        `rebase --continue` whenever the message file has a `# Conflicts:`
+        trailer (the post-conflict default).
+      - `git commit` without `-m` / `--message` / `-F` / `--file` /
+        `--no-edit` — opens the editor to author a commit message.
+
+    Conservative: false positives only set GIT_EDITOR=true in the subprocess
+    env, which is a no-op for any command that doesn't spawn an editor.
+    """
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        tokens = command.split()
+
+    i = 0
+    while i < len(tokens):
+        if tokens[i] == "git" and i + 1 < len(tokens):
+            sub = tokens[i + 1]
+            if sub == "rebase":
+                return True
+            if sub == "commit":
+                # Scan remaining args (until next shell separator) for a
+                # non-interactive message flag.
+                for arg in tokens[i + 2:]:
+                    if _is_shell_separator(arg):
+                        break
+                    base = arg.split("=", 1)[0]
+                    if base in _GIT_NONINTERACTIVE_FLAGS:
+                        return False
+                return True
+        i += 1
+    return False
+
+
 def _kill_process_tree(pid: int) -> None:
     """Kill a process and its entire child tree — mirrors TS killProcessTree."""
     if sys.platform == "win32":
@@ -235,12 +285,20 @@ def create_bash_tool(cwd: str, command_prefix: str | None = None) -> AgentTool:
             if sys.platform != "win32":
                 kwargs["start_new_session"] = True
 
+            env = {**os.environ}
+            if _git_command_needs_editor_disabled(command):
+                # Block interactive editor opens (vim/nano) on the agent's
+                # non-TTY stdin. GIT_EDITOR wins over core.editor; the
+                # sequence-editor covers `git rebase -i`'s todo list.
+                env["GIT_EDITOR"] = "true"
+                env["GIT_SEQUENCE_EDITOR"] = "true"
+
             process = await asyncio.create_subprocess_exec(
                 executable, *exec_args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=cwd,
-                env={**os.environ},
+                env=env,
                 **kwargs,
             )
 
