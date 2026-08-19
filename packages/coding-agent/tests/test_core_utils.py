@@ -7,6 +7,7 @@ Covers: utils/sleep.py, utils/git.py, utils/frontmatter.py,
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 
 import pytest
@@ -207,3 +208,328 @@ class TestShell:
         from pi_coding_agent.utils.shell import get_shell_env
         env = get_shell_env()
         assert isinstance(env, dict)
+
+
+# ============================================================================
+# cli debug log
+# ============================================================================
+
+class TestCliDebugLog:
+    def test_redact_image_base64_redacts_only_image_paths(self):
+        from pi_coding_agent.core.cli_debug_log import (
+            IMAGE_BASE64_REDACT_THRESHOLD_BYTES,
+            IMAGE_BASE64_REPLACEMENT_TEMPLATE,
+            redact_image_base64,
+        )
+
+        big = "A" * (IMAGE_BASE64_REDACT_THRESHOLD_BYTES + 20)
+        payload = {
+            "request": {
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "data": big}},
+                    {"type": "text", "text": big},
+                ],
+                "signature": big,
+            }
+        }
+
+        redacted = redact_image_base64(payload)
+
+        assert redacted["request"]["content"][0]["source"]["data"] == (
+            IMAGE_BASE64_REPLACEMENT_TEMPLATE.format(n=len(big))
+        )
+        assert redacted["request"]["content"][1]["text"] == big
+        assert redacted["request"]["signature"] == big
+
+    def test_log_event_writes_redacted_image_payload(self, tmp_path, monkeypatch):
+        from pi_coding_agent.core import cli_debug_log
+
+        log_path = tmp_path / "debug.jsonl"
+        big = "B" * (cli_debug_log.IMAGE_BASE64_REDACT_THRESHOLD_BYTES + 10)
+        monkeypatch.setattr(cli_debug_log, "_LOG_PATH", str(log_path))
+
+        cli_debug_log.log_event("image_payload", request={"source": {"type": "base64", "data": big}})
+
+        line = log_path.read_text(encoding="utf-8").strip()
+        parsed = json.loads(line)
+        assert big not in line
+        assert parsed["request"]["source"]["data"] == (
+            cli_debug_log.IMAGE_BASE64_REPLACEMENT_TEMPLATE.format(n=len(big))
+        )
+
+
+# ============================================================================
+# clarity pii
+# ============================================================================
+
+class TestClarityPiiWalk:
+    def test_vault_detokenizes_legacy_equals_token_alias(self):
+        from pi_coding_agent.clarity_pii.vault import Vault
+
+        vault = Vault()
+        token = vault.tokenize("jane@acme.com")
+
+        assert token == "[PII:EMAIL:1]"
+        assert vault.detokenize("email [PII:EMAIL=1]") == "email jane@acme.com"
+
+    def test_provider_payload_tokenization_skips_response_protocol_ids(self):
+        from pi_coding_agent.clarity_pii.vault import Vault
+        from pi_coding_agent.clarity_pii.walk import (
+            provider_payload_protocol_slots,
+            provider_payload_string_slots,
+        )
+
+        raw_function_call_id = "fc_0400e0ad26af8453016a4111111111111111b166aefb19465b3"
+        payload = {
+            "model": "gpt-5.5",
+            "input": [
+                {
+                    "id": "rs_09dc8f8587d38d3e016a3340667384819b9b9e1efb018d3194",
+                    "type": "reasoning",
+                    "encrypted_content": "opaque-4111111111111111",
+                    "summary": [],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "email jane@acme.com"}],
+                },
+                {
+                    "type": "function_call",
+                    "id": raw_function_call_id,
+                    "call_id": "call_4111111111111111",
+                    "name": "edit",
+                    "arguments": "{\"old_string\":\"email jane@acme.com\"}",
+                },
+            ],
+        }
+        vault = Vault()
+
+        for get, set_ in provider_payload_protocol_slots(payload):
+            set_(vault.detokenize(get()))
+        for get, set_ in provider_payload_string_slots(payload):
+            set_(vault.tokenize(get()))
+
+        reasoning = payload["input"][0]
+        assert reasoning["id"] == "rs_09dc8f8587d38d3e016a3340667384819b9b9e1efb018d3194"
+        assert reasoning["encrypted_content"] == "opaque-4111111111111111"
+        assert payload["input"][1]["content"][0]["text"] == "email [PII:EMAIL:1]"
+        assert payload["input"][2]["id"] == raw_function_call_id
+        assert payload["input"][2]["call_id"] == "call_4111111111111111"
+        assert payload["input"][2]["arguments"] == "{\"old_string\":\"email [PII:EMAIL:1]\"}"
+
+    def test_provider_payload_protocol_slots_restore_pretokenized_ids(self):
+        from pi_coding_agent.clarity_pii.vault import Vault
+        from pi_coding_agent.clarity_pii.walk import (
+            provider_payload_protocol_slots,
+            provider_payload_string_slots,
+        )
+
+        vault = Vault()
+        raw_card = "4111111111111111"
+        token = vault.tokenize(raw_card)
+        raw_id = f"fc_0400e0ad26af8453016a{raw_card}b166aefb19465b3"
+        payload = {
+            "input": [
+                {
+                    "type": "function_call",
+                    "id": raw_id.replace(raw_card, token),
+                    "call_id": f"call_{token}",
+                    "arguments": "{\"note\":\"email jane@acme.com\"}",
+                }
+            ]
+        }
+
+        for get, set_ in provider_payload_protocol_slots(payload):
+            set_(vault.detokenize(get()))
+        for get, set_ in provider_payload_string_slots(payload):
+            set_(vault.tokenize(get()))
+
+        assert payload["input"][0]["id"] == raw_id
+        assert payload["input"][0]["call_id"] == f"call_{raw_card}"
+        assert payload["input"][0]["arguments"] == "{\"note\":\"email [PII:EMAIL:1]\"}"
+
+    def test_provider_payload_tokenization_skips_anthropic_tool_use_id(self):
+        from pi_coding_agent.clarity_pii.vault import Vault
+        from pi_coding_agent.clarity_pii.walk import (
+            provider_payload_protocol_slots,
+            provider_payload_string_slots,
+        )
+
+        raw_card = "4111111111111111"
+        raw_tool_use_id = f"tc_prefix{raw_card}suffix"
+        payload = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": raw_tool_use_id,
+                            "content": "email jane@acme.com",
+                        }
+                    ],
+                }
+            ]
+        }
+        vault = Vault()
+
+        for get, set_ in provider_payload_protocol_slots(payload):
+            set_(vault.detokenize(get()))
+        for get, set_ in provider_payload_string_slots(payload):
+            set_(vault.tokenize(get()))
+
+        tool_result = payload["messages"][0]["content"][0]
+        assert tool_result["tool_use_id"] == raw_tool_use_id
+        assert tool_result["content"] == "email [PII:EMAIL:1]"
+
+
+def _graphwalks_like_prompt() -> str:
+    header = [
+        "You will be given a graph as a list of directed edges.",
+        "If asked for the parents of a node, only return incoming edges.",
+        "",
+        "Here is an example:",
+        "Operation:",
+        "Find the parents of node uvwx.",
+        "Final Answer: [abcd, efgh]",
+        "",
+        "Here is the graph to operate on:",
+        "The graph has the following edges:",
+    ]
+    edges = [f"node{i:03d} -> node{i + 1:03d}" for i in range(80)]
+    tail = [
+        "target-node -> outgoing-child",
+        "winner-2 -> target-node",
+        "winner -> target-node",
+        "",
+        "Operation:",
+        "Find the parents of node target-node.",
+        "",
+        "Return your final answer as a list of nodes.",
+        "Final Answer: []",
+    ]
+    return "\n".join(header + edges + tail)
+
+
+def test_active_compression_log_summary_preserves_actual_tail_operation(tmp_path):
+    from pi_coding_agent.active_compression.ccr import CCRStore
+    from pi_coding_agent.active_compression.compressor import compress
+
+    original = _graphwalks_like_prompt()
+    store = CCRStore(str(tmp_path / "ccr.db"))
+
+    compressed = compress(original, store)
+
+    assert "[CCR:" in compressed
+    assert "Find the parents of node target-node." in compressed
+    assert len(compressed) < len(original)
+
+
+def test_ccr_tail_query_returns_actual_task_block():
+    from pi_coding_agent.active_compression.search import search_original
+
+    result = search_original(_graphwalks_like_prompt(), "actual task tail operation")
+
+    assert result["route"] == "tail_slice"
+    assert "Find the parents of node target-node." in result["text"]
+    assert "winner -> target-node" in result["text"]
+
+
+def test_ccr_parent_query_returns_all_incoming_edges_only():
+    from pi_coding_agent.active_compression.search import search_original
+
+    result = search_original(_graphwalks_like_prompt(), "target-node parents edges")
+
+    assert result["route"] == "incoming_edges"
+    assert "winner -> target-node" in result["text"]
+    assert "winner-2 -> target-node" in result["text"]
+    assert "target-node -> outgoing-child" not in result["text"]
+
+
+def test_ccr_source_query_returns_all_outgoing_edges_only():
+    from pi_coding_agent.active_compression.search import search_original
+
+    result = search_original(_graphwalks_like_prompt(), "target-node ->")
+
+    assert result["route"] == "outgoing_edges"
+    assert "target-node -> outgoing-child" in result["text"]
+    assert "winner -> target-node" not in result["text"]
+
+
+def test_ccr_bfs_query_computes_exact_depth_without_frontier_turns():
+    from pi_coding_agent.active_compression.search import search_original
+
+    original = "\n".join(
+        [
+            "The graph has the following edges:",
+            "start -> a",
+            "start -> b",
+            "a -> c",
+            "a -> d",
+            "b -> e",
+            "c -> target",
+            "d -> off-target",
+            "e -> other",
+            "",
+            "Operation:",
+            "Perform a BFS from node start and return only the nodes at exactly depth 2 (not nodes at intermediate depths).",
+        ]
+    )
+
+    result = search_original(original, "edges graph list directed")
+
+    assert result["route"] == "graph_bfs"
+    assert "depth 1: 2 node(s)" in result["text"]
+    assert "depth 2: 3 node(s)" in result["text"]
+    assert "Final Answer: [c, d, e]" in result["text"]
+
+
+def test_ccr_parent_operation_query_ignores_example_bfs():
+    from pi_coding_agent.active_compression.search import search_original
+
+    original = "\n".join(
+        [
+            "Here is an example:",
+            "The graph has the following edges:",
+            "abcd -> uvwx",
+            "Operation:",
+            "Perform a BFS from node alke with depth 1.",
+            "Final Answer: []",
+            "",
+            "Here is the graph to operate on:",
+            "The graph has the following edges:",
+            "winner -> target",
+            "decoy -> other",
+            "",
+            "Operation:",
+            "Find the parents of node target.",
+            "",
+            "Final Answer: []",
+        ]
+    )
+
+    result = search_original(original, "edges graph operation node")
+
+    assert result["route"] == "graph_parents"
+    assert "Operation: Find the parents of node target." in result["text"]
+    assert "Final Answer: [winner]" in result["text"]
+    assert "BFS from node alke" not in result["text"]
+
+
+def test_ccr_task_query_on_paginated_page_directs_next_read_offset():
+    from pi_coding_agent.active_compression.search import search_original
+
+    page = "\n".join(
+        [
+            "The graph has the following edges:",
+            "a -> b",
+            "b -> c",
+            "",
+            "[Showing lines 1-2000 of 4394. Use offset=2001 to continue.]",
+        ]
+    )
+
+    result = search_original(page, "actual task operation")
+
+    assert result["route"] == "pagination_continue"
+    assert "offset=2001" in result["text"]
