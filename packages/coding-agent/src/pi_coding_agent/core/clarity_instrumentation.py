@@ -9,9 +9,9 @@ clarity-backend forwards to Langfuse. Query them back per session/correlation.
 Design:
 - **Env-gated.** No-op unless a base URL + token are configured. Never a hard
   dependency, never changes agent behaviour.
-- **Fire-and-forget by default.** Emits are scheduled on the running loop. An
-  explicit durable-eval mode may flush pending posts at a turn boundary; sink
-  failures still never crash the agent turn.
+- **Asynchronous delivery.** Emits are scheduled on the running loop while the
+  agent works, then pending deliveries are flushed at CLI shutdown. A slow or
+  failing sink can never crash or change the result of the agent turn.
 - **Safe serialization + size caps.** Arbitrary provider payloads are coerced to
   JSON-able structures and capped so a huge context can't blow the sink.
 
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 _MAX_FIELD_CHARS = 200_000  # keep full system prompts; cap only the absurd
 _RETRY_DELAYS_SECONDS = (0.25, 0.75)
 _seq = itertools.count(1)
-_pending_tasks: set[asyncio.Task[None]] = set()
+_pending: set[asyncio.Task[None]] = set()
 
 
 def _config() -> tuple[str, str] | None:
@@ -148,8 +148,8 @@ def emit(
     input: Any = None,
     output: Any = None,
     metadata: dict[str, Any] | None = None,
-) -> asyncio.Task[None] | None:
-    """Schedule one instrumentation event and retain its task; never raises.
+) -> None:
+    """Schedule one asynchronous instrumentation event; never raises.
 
     ``name`` must be alphanumeric + ``_.:-`` per the Clarity route validator.
     """
@@ -171,9 +171,8 @@ def emit(
     try:
         loop = asyncio.get_running_loop()
         task = loop.create_task(_post(name, input, output, md))
-        _pending_tasks.add(task)
-        task.add_done_callback(_pending_tasks.discard)
-        return task
+        _pending.add(task)
+        task.add_done_callback(_pending.discard)
     except RuntimeError:
         # No running loop (rare, e.g. sync init path) — best-effort synchronous.
         try:
@@ -195,6 +194,13 @@ async def flush(*, timeout_seconds: float = 15.0) -> None:
             len(pending),
             timeout_seconds,
         )
+
+
+async def flush() -> None:
+    """Wait for every scheduled instrumentation delivery to settle."""
+    while _pending:
+        tasks = tuple(_pending)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 __all__ = ["emit", "enabled", "flush"]
