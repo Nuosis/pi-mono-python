@@ -166,11 +166,10 @@ class TestArgParsing:
         assert args.tools == ["read", "bash"]
         assert args.exclude_tools == ["bash", "edit"]
 
-    def test_parse_invalid_tool_skipped(self, capsys):
+    def test_parse_tools_preserves_names_for_late_extension_resolution(self):
         from pi_coding_agent.cli_sub.args import parse_args
-        args = parse_args(["--tools", "read,nonexistent"])
-        assert "nonexistent" not in (args.tools or [])
-        assert "read" in (args.tools or [])
+        args = parse_args(["--tools", "read,extension_lookup"])
+        assert args.tools == ["read", "extension_lookup"]
 
     def test_parse_thinking_level(self):
         from pi_coding_agent.cli_sub.args import parse_args

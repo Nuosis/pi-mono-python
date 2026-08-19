@@ -198,17 +198,11 @@ def parse_args(
             result.no_builtin_tools = True
         elif arg in ("--tools", "-t") and i + 1 < len(args):
             i += 1
-            tool_names = [s.strip() for s in args[i].split(",")]
-            valid: list[str] = []
-            for name in tool_names:
-                if name in VALID_TOOL_NAMES:
-                    valid.append(name)
-                else:
-                    print(
-                        f"Warning: Unknown tool \"{name}\". Valid tools: {', '.join(sorted(VALID_TOOL_NAMES))}",
-                        file=sys.stderr,
-                    )
-            result.tools = valid
+            # Extension tools are loaded after CLI parsing, so this layer cannot
+            # determine whether a non-builtin name is valid. Preserve the
+            # requested allowlist and let session construction resolve it
+            # against the complete builtin + custom + extension registry.
+            result.tools = [s.strip() for s in args[i].split(",") if s.strip()]
         elif arg in ("--exclude-tools", "-xt") and i + 1 < len(args):
             i += 1
             result.exclude_tools = [s.strip() for s in args[i].split(",") if s.strip()]

@@ -19,6 +19,7 @@ Config (first match wins):
 - URL:   TAU_INSTRUMENTATION_URL | CLARITY_BACKEND_BASE_URL | CLARITY_BASE_URL
 - Token: TAU_INSTRUMENTATION_TOKEN | CLARITY_API_KEY
 - Correlation: CLAIRE_SESSION_ID | TAU_SESSION_ID  (tags every event)
+- Role:        TAU_INSTRUMENTATION_ROLE            (optional event tag)
 """
 from __future__ import annotations
 
@@ -162,6 +163,9 @@ def emit(
         # the whole agentic flow is retrievable via
         # GET /clarify/instrumentation/traces?correlation_id=<session_id>.
         md["correlation_id"] = sid
+    role = os.environ.get("TAU_INSTRUMENTATION_ROLE", "").strip()
+    if role:
+        md["role"] = role
     if metadata:
         md.update(metadata)
     try:

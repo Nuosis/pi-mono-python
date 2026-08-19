@@ -372,6 +372,47 @@ class TestSDKAlignment:
         }
 
     @pytest.mark.asyncio
+    async def test_explicit_tool_allowlist_can_select_only_an_extension_tool(self, tmp_path):
+        from pi_coding_agent.core.extensions.types import Extension, ToolDefinition
+
+        async def execute(tool_call_id, params, cancel_event=None, on_update=None, ctx=None):
+            return {"content": [{"type": "text", "text": "accepted"}]}
+
+        extension = Extension(
+            path="/fixture/decision-tools.py",
+            resolved_path="/fixture/decision-tools.py",
+            tools={
+                "d4_accept_criticism": ToolDefinition(
+                    name="d4_accept_criticism",
+                    label="Accept Criticism",
+                    description="Commit the Critic decision",
+                    parameters={"type": "object", "properties": {}},
+                    execute=execute,
+                )
+            },
+        )
+
+        class Loader(_FakeResourceLoader):
+            def get_extensions(self):
+                return {
+                    "extensions": [extension],
+                    "diagnostics": [],
+                    "runtime": {"flagValues": {}},
+                }
+
+        result = await create_agent_session(
+            CreateAgentSessionOptions(
+                cwd=str(tmp_path),
+                model=get_model("anthropic", "claude-3-5-sonnet-20241022"),
+                resource_loader=Loader(),
+                tools=["d4_accept_criticism"],
+            )
+        )
+
+        assert "d4_accept_criticism" in result.session.get_all_tool_names()
+        assert result.session.get_active_tool_names() == ["d4_accept_criticism"]
+
+    @pytest.mark.asyncio
     async def test_extension_tools_receive_session_backed_context_actions(self, tmp_path):
         from pi_coding_agent.core.extensions.types import Extension, ToolDefinition
 
