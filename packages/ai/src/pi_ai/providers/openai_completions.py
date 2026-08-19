@@ -202,6 +202,8 @@ async def stream_simple(
 
     params = await apply_on_payload(params, model, opts.get("on_payload"))
 
+    params = await apply_on_payload(params, model, opts.on_payload)
+
     partial = _make_empty_assistant(model)
     content_blocks: list[Any] = []
     text_index = -1
@@ -209,6 +211,7 @@ async def stream_simple(
     tool_indices: dict[str, int] = {}
     tool_arg_buffers: dict[str, str] = {}
     usage = Usage()
+    finish_reason: str | None = None
 
     yield EventStart(type="start", partial=partial)
 

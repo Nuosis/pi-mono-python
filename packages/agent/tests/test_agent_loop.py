@@ -1162,8 +1162,8 @@ async def test_agent_loop_prepare_next_turn_replaces_context_before_next_model_c
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_injects_steering_after_current_tool_batch_completes():
-    """Queued steering should be injected after all same-batch tool calls complete."""
+async def test_agent_loop_injects_steering_after_next_tool_call_completes():
+    """Queued steering should fire at the end of the next tool call, not after the whole batch."""
     from pi_ai import get_model
 
     model = get_model("anthropic", "claude-3-5-sonnet-20241022")
@@ -1275,7 +1275,9 @@ async def test_agent_loop_injects_steering_after_current_tool_batch_completes():
     async for event in stream:
         events.append(event)
 
-    assert executed == ["first", "second"]
+    # Steering fires at the end of the *next* tool call — only the first tool
+    # in the batch runs before the queued steering interrupts the loop.
+    assert executed == ["first"]
     assert saw_steering_on_second_call is True
     event_sequence = []
     for event in events:
@@ -1285,7 +1287,153 @@ async def test_agent_loop_injects_steering_after_current_tool_batch_completes():
             event_sequence.append(f"tool:{event.message.tool_call_id}")
         elif getattr(event.message, "role", "") == "user" and getattr(event.message, "content", "") == "interrupt":
             event_sequence.append("user:interrupt")
-    assert event_sequence == ["tool:tc-first", "tool:tc-second", "user:interrupt"]
+    assert event_sequence == ["tool:tc-first", "user:interrupt"]
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_injects_steering_mid_parallel_batch():
+    """Queued steering fires at the end of the next tool call during a parallel batch.
+
+    Two tools run concurrently. The steering getter only returns a message
+    once the first tool has finished. The second tool must be cancelled and
+    its result dropped — steering applies at the end of the *next* tool call,
+    not after the entire batch.
+    """
+    from pi_ai import get_model
+
+    model = get_model("anthropic", "claude-3-5-sonnet-20241022")
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    completions: list[str] = []
+    steering_delivered = False
+    saw_steering_on_second_call = False
+    call_count = 0
+
+    async def execute_first(tool_call_id, params, cancel=None, on_update=None):
+        first_started.set()
+        await asyncio.sleep(0.02)
+        completions.append("first")
+        return AgentToolResult(
+            content=[TextContent(type="text", text="first-done")],
+            details={},
+        )
+
+    async def execute_second(tool_call_id, params, cancel=None, on_update=None):
+        second_started.set()
+        # Block long enough for the steering drain (after first) to fire and
+        # cancel this task. If cancellation is wired up correctly, we never
+        # append "second" to completions.
+        try:
+            await asyncio.sleep(5.0)
+        except asyncio.CancelledError:
+            raise
+        completions.append("second")
+        return AgentToolResult(
+            content=[TextContent(type="text", text="second-done")],
+            details={},
+        )
+
+    first_tool = AgentTool(
+        name="first",
+        label="first",
+        description="first",
+        parameters={"type": "object", "properties": {}, "required": []},
+        execute=execute_first,
+    )
+    second_tool = AgentTool(
+        name="second",
+        label="second",
+        description="second",
+        parameters={"type": "object", "properties": {}, "required": []},
+        execute=execute_second,
+    )
+    queued_message = make_user_message("redirect")
+
+    async def get_steering_messages():
+        nonlocal steering_delivered
+        if "first" in completions and not steering_delivered:
+            steering_delivered = True
+            return [queued_message]
+        return []
+
+    async def _stream_two_tools_then_done(m, ctx, opts=None):
+        nonlocal call_count, saw_steering_on_second_call
+        call_count += 1
+        if call_count == 2:
+            saw_steering_on_second_call = any(
+                getattr(msg, "role", "") == "user" and getattr(msg, "content", "") == "redirect"
+                for msg in ctx.messages
+            )
+        from pi_ai.types import EventToolCallStart, EventToolCallEnd
+
+        if call_count == 1:
+            first_call = ToolCall(type="toolCall", id="tc-first", name="first", arguments={})
+            second_call = ToolCall(type="toolCall", id="tc-second", name="second", arguments={})
+            partial = AssistantMessage(
+                role="assistant",
+                content=[first_call, second_call],
+                api=m.api,
+                provider=m.provider,
+                model=m.id,
+                usage=Usage(),
+                stop_reason="toolUse",
+                timestamp=_ts(),
+            )
+            yield EventStart(type="start", partial=partial)
+            with_calls = partial
+            yield EventToolCallStart(type="toolcall_start", content_index=0, partial=with_calls)
+            yield EventToolCallEnd(type="toolcall_end", content_index=0, tool_call=first_call, partial=with_calls)
+            yield EventToolCallStart(type="toolcall_start", content_index=1, partial=with_calls)
+            yield EventToolCallEnd(type="toolcall_end", content_index=1, tool_call=second_call, partial=with_calls)
+            final = AssistantMessage(
+                role="assistant",
+                content=[first_call, second_call],
+                api=m.api,
+                provider=m.provider,
+                model=m.id,
+                usage=Usage(),
+                stop_reason="toolUse",
+                timestamp=_ts(),
+            )
+            yield EventDone(type="done", reason="toolUse", message=final)
+            return
+
+        partial = AssistantMessage(
+            role="assistant",
+            content=[TextContent(type="text", text="done")],
+            api=m.api,
+            provider=m.provider,
+            model=m.id,
+            usage=Usage(),
+            stop_reason="stop",
+            timestamp=_ts(),
+        )
+        yield EventStart(type="start", partial=partial)
+        yield EventDone(type="done", reason="stop", message=partial)
+
+    config = AgentLoopConfig(
+        model=model,
+        convert_to_llm=lambda msgs: [
+            m for m in msgs if hasattr(m, "role") and m.role in ("user", "assistant", "toolResult")
+        ],
+        get_steering_messages=get_steering_messages,
+    )
+
+    stream = agent_loop(
+        [make_user_message("Run both")],
+        AgentContext(messages=[], tools=[first_tool, second_tool]),
+        config,
+        stream_fn=_stream_two_tools_then_done,
+    )
+    events = []
+    async for event in stream:
+        events.append(event)
+
+    # First tool completed; second was cancelled mid-flight by the steering drain.
+    assert "first" in completions
+    assert "second" not in completions
+    # The queued steering message was injected into the second model call's context.
+    assert saw_steering_on_second_call is True
 
 
 @pytest.mark.asyncio

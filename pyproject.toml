@@ -49,6 +49,8 @@ dependencies = [
     "pygments>=2.17.0",
     "wcwidth>=0.2.13",
     "mistune>=3.0.2",
+    "pillow>=11.0.0",
+    "tiktoken>=0.13.0",
 ]
 
 [project.optional-dependencies]
@@ -83,6 +85,11 @@ tau = "pi_coding_agent.main:main"
 "packages/aliases/tau_agent" = "tau_agent"
 "packages/aliases/tau_coding_agent" = "tau_coding_agent"
 "packages/aliases/tau_tui" = "tau_tui"
+# Bundled, first-class skills (baked into the harness — see
+# `pi_coding_agent.bundled_skills`). The repo-root `skills/` tree is the
+# source of truth; the wheel ships it under `pi_coding_agent/bundled_skills/`
+# so `get_bundled_skills_dir()` resolves the same layout in dev and installed.
+"skills/agent-build-pattern" = "pi_coding_agent/bundled_skills/agent-build-pattern"
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -95,6 +102,7 @@ include = [
     "packages/aliases/tau_agent",
     "packages/aliases/tau_coding_agent",
     "packages/aliases/tau_tui",
+    "skills/agent-build-pattern",
     "README.md",
     "LICENSE",
     "pyproject.toml",

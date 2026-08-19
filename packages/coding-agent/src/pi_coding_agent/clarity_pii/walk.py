@@ -10,6 +10,30 @@ import copy
 from typing import Any, Callable, Iterable
 
 
+PROVIDER_PAYLOAD_PROTOCOL_KEYS = frozenset({
+    "api",
+    "call_id",
+    "encrypted_content",
+    "finish_reason",
+    "id",
+    "include",
+    "model",
+    "name",
+    "object",
+    "previous_response_id",
+    "role",
+    "status",
+    "store",
+    "stream",
+    "tool_choice",
+    "tool_call_id",
+    "toolCallId",
+    "tool_use_id",
+    "toolUseId",
+    "type",
+})
+
+
 def content_text_slots(content: Any) -> Iterable[tuple[Callable[[], str], Callable[[str], None]]]:
     if isinstance(content, str):
         return
@@ -34,14 +58,20 @@ def content_text_slots(content: Any) -> Iterable[tuple[Callable[[], str], Callab
                 yield from dict_string_slots(item.arguments)
 
 
-def dict_string_slots(d: dict[str, Any]) -> Iterable[tuple[Callable[[], str], Callable[[str], None]]]:
+def dict_string_slots(
+    d: dict[str, Any],
+    *,
+    skip_keys: set[str] | frozenset[str] | None = None,
+) -> Iterable[tuple[Callable[[], str], Callable[[str], None]]]:
     for key, val in list(d.items()):
+        if skip_keys and key in skip_keys:
+            continue
         if isinstance(val, str):
             yield (lambda k=key: d[k], lambda v, k=key: d.__setitem__(k, v))
         elif isinstance(val, dict):
-            yield from dict_string_slots(val)
+            yield from dict_string_slots(val, skip_keys=skip_keys)
         elif isinstance(val, list):
-            yield from list_string_slots(val)
+            yield from list_string_slots(val, skip_keys=skip_keys)
 
 
 _PROVIDER_PROTOCOL_KEYS = frozenset(
@@ -110,9 +140,36 @@ def list_string_slots(lst: list[Any]) -> Iterable[tuple[Callable[[], str], Calla
         if isinstance(val, str):
             yield (lambda i=i: lst[i], lambda v, i=i: lst.__setitem__(i, v))
         elif isinstance(val, dict):
-            yield from dict_string_slots(val)
+            yield from dict_string_slots(val, skip_keys=skip_keys)
         elif isinstance(val, list):
-            yield from list_string_slots(val)
+            yield from list_string_slots(val, skip_keys=skip_keys)
+
+
+def provider_payload_string_slots(d: dict[str, Any]) -> Iterable[tuple[Callable[[], str], Callable[[str], None]]]:
+    """Yield editable provider payload text while leaving protocol fields intact."""
+    yield from dict_string_slots(d, skip_keys=PROVIDER_PAYLOAD_PROTOCOL_KEYS)
+
+
+def provider_payload_protocol_slots(d: dict[str, Any]) -> Iterable[tuple[Callable[[], str], Callable[[str], None]]]:
+    """Yield protected provider protocol fields that must round-trip exactly."""
+    for key, val in list(d.items()):
+        if key in PROVIDER_PAYLOAD_PROTOCOL_KEYS and isinstance(val, str):
+            yield (lambda k=key: d[k], lambda v, k=key: d.__setitem__(k, v))
+            continue
+        if isinstance(val, dict):
+            yield from provider_payload_protocol_slots(val)
+        elif isinstance(val, list):
+            yield from _provider_payload_protocol_list_slots(val)
+
+
+def _provider_payload_protocol_list_slots(
+    lst: list[Any],
+) -> Iterable[tuple[Callable[[], str], Callable[[str], None]]]:
+    for val in lst:
+        if isinstance(val, dict):
+            yield from provider_payload_protocol_slots(val)
+        elif isinstance(val, list):
+            yield from _provider_payload_protocol_list_slots(val)
 
 
 def apply_to_message(msg: Any, fn: Callable[[str], str]) -> Any:
