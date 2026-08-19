@@ -29,6 +29,7 @@ SessionEntryType = Literal[
     "custom",
     "session_info",
     "label",
+    "recovery",
 ]
 
 
@@ -264,6 +265,14 @@ def build_session_context(
                     "content": [{"type": "text", "text": f"[Branch summary: {summary}]"}],
                     "timestamp": entry.timestamp,
                 })
+        elif entry.type == "recovery":
+            summary = entry.data.get("summary", "")
+            if summary:
+                messages.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": f"[Recovery checkpoint:\n{summary}]"}],
+                    "timestamp": entry.timestamp,
+                })
 
     if compaction:
         first_kept = compaction.data.get("firstKeptEntryId")
@@ -376,6 +385,11 @@ class SessionManager:
         except OSError:
             pass
 
+        if self._leaf_id is None and self._entries:
+            last_id = self._entries[-1].get("id")
+            if isinstance(last_id, str):
+                self._leaf_id = last_id
+
         # Run migrations if needed
         all_entries = ([self._header] if self._header else []) + self._entries
         if migrate_to_current_version(all_entries):
@@ -390,6 +404,7 @@ class SessionManager:
             lines.append(json.dumps(self._header, ensure_ascii=False))
         for entry in self._entries:
             lines.append(json.dumps(entry, ensure_ascii=False))
+        os.makedirs(os.path.dirname(self._session_file_path), exist_ok=True)
         with open(self._session_file_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
 
@@ -398,7 +413,11 @@ class SessionManager:
         path = self._session_file_path
         if not path:
             return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        should_restore_header = not os.path.exists(path) and self._header and obj is not self._header
         with open(path, "a", encoding="utf-8") as f:
+            if should_restore_header:
+                f.write(json.dumps(self._header, ensure_ascii=False) + "\n")
             f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
     # ── Factory classmethods ──────────────────────────────────────────────────
@@ -469,6 +488,8 @@ class SessionManager:
         # Copy source entries into target
         for entry in source._entries:
             target._entries.append(entry)
+            if "id" in entry:
+                target._by_id[entry["id"]] = entry
             target._append_raw(entry)
         return target
 
@@ -756,9 +777,29 @@ class SessionManager:
 
     def build_context(self, leaf_id: str | None = None) -> SessionContext:
         """Build session context for the agent from the entry tree."""
+        self.refresh_active_compression_refs()
         entries = self.get_entries()
         by_id = {e.id: e for e in entries}
         return build_session_context(entries, leaf_id or self._leaf_id, by_id)
+
+    def refresh_active_compression_refs(self) -> dict[str, int]:
+        """Refresh/rebuild CCR refs held by persisted compressed context entries."""
+        try:
+            from pi_coding_agent.active_compression.persisted_context import refresh_or_rebuild_session_refs
+
+            return refresh_or_rebuild_session_refs(self._entries)
+        except Exception:
+            # Session loading must not fail because the optimization cache is unavailable.
+            return {"refreshed": 0, "rebuilt": 0, "missing": 0}
+
+    def apply_persisted_active_compression(self, messages: list[Any]) -> list[Any]:
+        """Use persisted compressed tool-result messages in live model context."""
+        try:
+            from pi_coding_agent.active_compression.persisted_context import apply_persisted_compressed_messages
+
+            return apply_persisted_compressed_messages(messages, self._entries)
+        except Exception:
+            return messages
 
     # ── Append methods ─────────────────────────────────────────────────────
 
@@ -787,7 +828,12 @@ class SessionManager:
         self._append_raw(entry)
         return entry["id"]
 
-    def append_message(self, message: dict[str, Any], parent_id: str | None = None) -> str:
+    def append_message(
+        self,
+        message: dict[str, Any],
+        parent_id: str | None = None,
+        active_compression: dict[str, Any] | None = None,
+    ) -> str:
         """Append a message entry."""
         entry = {
             "id": self._new_id(),
@@ -796,6 +842,8 @@ class SessionManager:
             "parentId": parent_id or (self.get_leaf_entry().id if self.get_leaf_entry() else None),
             "message": message,
         }
+        if active_compression is not None:
+            entry["activeCompression"] = active_compression
         return self._append_entry(entry)
 
     def append_model_change(self, provider: str, model_id: str) -> str:
@@ -848,6 +896,30 @@ class SessionManager:
         if from_hook:
             extra["fromHook"] = True
         return self._append_entry(self._make_entry("branch_summary", extra))
+
+    def append_recovery(
+        self,
+        summary: str,
+        *,
+        reason: str,
+        source_entry_id: str,
+        branch_point_id: str | None = None,
+        dropped_entry_ids: list[str] | None = None,
+        preserved_entry_ids: list[str] | None = None,
+        details: Any = None,
+    ) -> str:
+        """Append a recovery checkpoint entry injected into LLM context."""
+        extra: dict[str, Any] = {
+            "summary": summary,
+            "reason": reason,
+            "sourceEntryId": source_entry_id,
+            "branchPointId": branch_point_id,
+            "droppedEntryIds": list(dropped_entry_ids or []),
+            "preservedEntryIds": list(preserved_entry_ids or []),
+        }
+        if details is not None:
+            extra["details"] = details
+        return self._append_entry(self._make_entry("recovery", extra))
 
     def append_session_info(self, name: str | None = None) -> str:
         """Append a session_info entry (user-defined display name)."""
@@ -924,6 +996,8 @@ class SessionManager:
         # Copy entries up to branch_point
         for raw in self._entries:
             new_mgr._entries.append(raw)
+            if "id" in raw:
+                new_mgr._by_id[raw["id"]] = raw
             new_mgr._append_raw(raw)
             if branch_point_id and raw.get("id") == branch_point_id:
                 break

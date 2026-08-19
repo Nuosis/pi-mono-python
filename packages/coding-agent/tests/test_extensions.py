@@ -94,12 +94,29 @@ class TestExtensionLoader:
         with open(path, "w") as f:
             f.write(content)
 
+    def test_a2a_is_not_auto_loaded_as_bundled_extension(self, tmp_path):
+        from pi_coding_agent.core.resource_loader import get_extension_discovery_paths
+
+        project = tmp_path / "project"
+        agent_dir = tmp_path / ".tau" / "agent"
+        project.mkdir()
+        agent_dir.mkdir(parents=True)
+
+        paths = get_extension_discovery_paths(
+            str(project),
+            str(agent_dir),
+            inherit_global=False,
+        )
+
+        assert not any("/a2a/extension.py" in path.replace(os.sep, "/") for path in paths)
+
     def test_discovers_user_file_and_package_extensions(self, tmp_path, monkeypatch):
         from pi_coding_agent.core.resource_loader import get_extension_discovery_paths
 
         # Isolate from the always-on bundled built-ins (covered by their own tests).
         monkeypatch.setenv("PI_CLARITY_PII_DISABLED", "1")
         monkeypatch.setenv("PI_ACTIVE_COMPRESSION_DISABLED", "1")
+        monkeypatch.setenv("TAU_A2A_DISABLED", "1")
         home = tmp_path / "home"
         project = tmp_path / "project"
         extensions_dir = home / ".tau" / "extensions"
@@ -128,6 +145,7 @@ class TestExtensionLoader:
         # Isolate from the always-on bundled built-ins (covered by their own tests).
         monkeypatch.setenv("PI_CLARITY_PII_DISABLED", "1")
         monkeypatch.setenv("PI_ACTIVE_COMPRESSION_DISABLED", "1")
+        monkeypatch.setenv("TAU_A2A_DISABLED", "1")
         home = tmp_path / "home"
         project = tmp_path / "project"
         discovered = home / ".tau" / "extensions" / "discovered.py"

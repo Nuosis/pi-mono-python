@@ -327,7 +327,14 @@ class TestToolManagement:
     def test_set_active_tools_by_name(self, agent_session):
         agent_session.set_active_tools_by_name(["bash", "read"])
         active = agent_session.get_active_tool_names()
-        assert set(active) == {"bash", "read"}
+        assert {"bash", "read"} <= set(active)
+        # Goal tools are opt-in. Without an explicit `goal` alias or named
+        # goal tool in the active set, they must not be force-included —
+        # otherwise RPC/embedded sessions pay tool-list overhead even when
+        # the developer never asked for goal machinery.
+        assert not ({"get_goal", "set_goal", "update_goal", "clear_goal"} & set(active))
+        assert "write" not in active
+        assert "edit" not in active
         # System prompt should be rebuilt to reflect new tool set
         prompt = agent_session.system_prompt
         assert "bash" in prompt

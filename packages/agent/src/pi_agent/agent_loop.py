@@ -268,6 +268,7 @@ async def _run_loop(
             has_more_tool_calls = len(tool_calls) > 0
 
             tool_results: list[ToolResultMessage] = []
+            mid_batch_steering: list[Any] = []
             if has_more_tool_calls:
                 execution = await _execute_tool_calls(
                     current_context.tools,
@@ -279,6 +280,7 @@ async def _run_loop(
                     config.get_steering_messages,
                 )
                 tool_results.extend(execution["tool_results"])
+                mid_batch_steering = list(execution.get("pending_steering") or [])
                 has_more_tool_calls = not bool(execution.get("terminate", False))
                 if execution.get("terminate"):
                     terminal_state = "tool_terminated"
@@ -338,8 +340,8 @@ async def _run_loop(
                     ev_stream.end(new_messages)
                     return
 
-            pending_messages = []
-            if config.get_steering_messages:
+            pending_messages = list(mid_batch_steering)
+            if not pending_messages and config.get_steering_messages:
                 pending_messages = await config.get_steering_messages()
 
         # Check for follow-up messages
@@ -511,6 +513,7 @@ async def _execute_tool_calls(
         config,
         cancel_event,
         ev_stream,
+    get_steering_messages,
     )
 
 
@@ -526,6 +529,7 @@ async def _execute_tool_calls_sequential(
 ) -> dict[str, Any]:
     results: list[ToolResultMessage] = []
     terminate_flags: list[bool] = []
+    pending_steering: list[Any] = []
 
     for tool_call in tool_calls:
         ev_stream.push(AgentEventToolStart(
@@ -572,9 +576,20 @@ async def _execute_tool_calls_sequential(
         terminate_flags.append(_tool_result_terminates(finalized["result"]))
         _emit_tool_result_message(tool_result_msg, ev_stream)
 
+        # Drain queued steering after each tool call so the user's message
+        # fires at the end of the *next* tool call, not after the whole batch.
+        if get_steering_messages is not None and not pending_steering:
+            try:
+                pending_steering = await get_steering_messages()
+            except Exception:
+                pending_steering = []
+            if pending_steering:
+                break
+
     return {
         "tool_results": results,
         "terminate": bool(terminate_flags) and all(terminate_flags),
+        "pending_steering": pending_steering,
     }
 
 
@@ -586,6 +601,7 @@ async def _execute_tool_calls_parallel(
     config: AgentLoopConfig,
     cancel_event: asyncio.Event | None,
     ev_stream: EventStream[AgentEvent, list[AgentMessage]],
+    get_steering_messages: Any | None = None,
 ) -> dict[str, Any]:
     preflight_entries: list[tuple[str, dict[str, Any]]] = []
 
@@ -628,19 +644,62 @@ async def _execute_tool_calls_parallel(
         if cancel_event and cancel_event.is_set():
             break
 
+    # Run prepared tool calls concurrently. After each tool completes, drain
+    # queued steering — if the user staged a message, cancel the remaining    # in-flight tools so the steering fires at the end of the *next* tool
+    # call, not after the entire batch finishes.
+    finalized_by_index: dict[int, dict[str, Any]] = {}
+    pending_tasks: dict[asyncio.Task[Any], int] = {}
+    for idx, (kind, value) in enumerate(preflight_entries):
+        if kind == "finalized":
+            finalized_by_index[idx] = value
+            continue
+        task = asyncio.create_task(
+            _execute_prepared_tool_call_and_emit(
+                current_context,
+                assistant_message,
+                value,
+                config,
+                cancel_event,
+                ev_stream,
+            )
+        )
+        pending_tasks[task] = idx
+
+    pending_steering: list[Any] = []
+    while pending_tasks:
+        done, _ = await asyncio.wait(
+            list(pending_tasks.keys()),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in done:
+            idx = pending_tasks.pop(task)
+            if task.cancelled():
+                continue
+            # _execute_prepared_tool_call converts exceptions into is_error
+            # tool results, so task.result() does not raise here.
+            finalized_by_index[idx] = task.result()
+
+        if pending_steering or get_steering_messages is None:
+            continue
+        try:
+            pending_steering = await get_steering_messages()
+        except Exception:
+            pending_steering = []
+        if pending_steering:
+            # Cancel remaining in-flight tools so steering fires at the end
+            # of the *next* tool call, not after the whole batch.
+            in_flight = list(pending_tasks.keys())
+            for task in in_flight:
+                task.cancel()
+            await asyncio.gather(*in_flight, return_exceptions=True)
+            pending_tasks.clear()
+
+    # Materialize in original tool-call order so tool_use ↔ tool_result    # alignment is preserved regardless of completion order.
     finalized_calls: list[dict[str, Any]] = []
-    for entry in await asyncio.gather(*[
-        _execute_prepared_tool_call_and_emit(
-            current_context,
-            assistant_message,
-            value,
-            config,
-            cancel_event,
-            ev_stream,
-        ) if kind == "prepared" else _resolved(value)
-        for kind, value in preflight_entries
-    ]):
-        finalized_calls.append(entry)
+    for idx in range(len(preflight_entries)):
+        entry = finalized_by_index.get(idx)
+        if entry is not None:
+            finalized_calls.append(entry)
 
     results: list[ToolResultMessage] = []
     terminate_flags: list[bool] = []
@@ -653,6 +712,7 @@ async def _execute_tool_calls_parallel(
     return {
         "tool_results": results,
         "terminate": bool(terminate_flags) and all(terminate_flags),
+        "pending_steering": pending_steering,
     }
 
 

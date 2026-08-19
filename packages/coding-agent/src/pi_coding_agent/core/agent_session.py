@@ -36,6 +36,41 @@ from .auth_storage import AuthStorage
 from .compaction import compact_context, should_compact
 
 
+@dataclasses.dataclass
+class SessionGoal:
+    """In-memory session goal state. Lives on AgentSession; never persisted.
+
+    `status` transitions:
+      - "active"   — current; the agent continues working toward it
+      - "complete" — terminal; signals the agent loop to stop
+      - "blocked"  — terminal; signals the agent loop to stop
+    """
+
+    objective: str
+    status: str = "active"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in ("complete", "blocked")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"objective": self.objective, "status": self.status}
+
+
+def _goal_tool_matches(name: str) -> bool:
+    """True if `name` opts a goal tool into the active set."""
+    if name in _GOAL_TOOL_NAMES_SET or name == _GOAL_ALIAS:
+        return True
+    return False
+
+
+_GOAL_TOOL_NAMES_SET: frozenset[str] = frozenset(
+    {"get_goal", "set_goal", "update_goal", "clear_goal"}
+)
+_GOAL_ALIAS = "goal"
+_GOAL_TERMINAL_STATUSES = frozenset({"complete", "blocked"})
+
+
 def _active_compression_on() -> bool:
     """True when active compression (Headroom/CCR) is enabled — in which case
     proactive summarization compaction stands down (it's the fallback)."""
@@ -122,7 +157,14 @@ class AgentSession:
         self._extension_bindings: dict[str, Any] = {}
         self._steering_mode_override: str | None = None
         self._follow_up_mode_override: str | None = None
-        self._current_goal = self._initial_goal_from_settings()
+        self._goal_terminated: bool = False
+        self._goal: SessionGoal | None = None
+        self._initial_active_tool_names: list[str] | None = (
+            list(initial_active_tool_names)
+            if initial_active_tool_names is not None
+            else None
+        )
+        self._current_goal = self._initial_goal_from_session_vars()
 
         if session_manager is not None:
             self._session_manager = session_manager
@@ -132,13 +174,27 @@ class AgentSession:
         self.session_id = self._session_manager.get_session_id()
         self._extension_runner = self._create_extension_runner()
 
-        # Build all tools; keep registry for set_active_tools_by_name
+        # Build all tools; keep registry for set_active_tools_by_name.
+        # Order of precedence for the default active list:
+        #   1. ctor `initial_active_tool_names` if explicitly passed
+        #   2. settings.json's `tools` list (read via self._settings_manager)
+        #   3. hardcoded ["read", "bash", "edit", "write"] as a final fallback
+        # The settings file is authoritative when ctor didn't override it.
         self._all_tools: list[AgentTool] = self._build_tools()
-        active_names = (
-            list(initial_active_tool_names)
-            if initial_active_tool_names is not None
-            else ["read", "bash", "edit", "write"]
-        )
+        if initial_active_tool_names is not None:
+            active_names = list(initial_active_tool_names)
+        else:
+            settings_obj = (
+                self._settings_manager.get()
+                if self._settings_manager is not None else None
+            )
+            settings_tools = (
+                getattr(settings_obj, "tools", None) if settings_obj is not None else None
+            )
+            if settings_tools:
+                active_names = list(settings_tools)
+            else:
+                active_names = ["read", "bash", "edit", "write"]
         active_tools = self._tools_for_names(active_names)
 
         # Resolve model
@@ -157,6 +213,7 @@ class AgentSession:
             transform_context=self._transform_context,
             on_payload=self._on_provider_payload,
             on_response=self._on_provider_response,
+            shouldStopAfterTurn=self._should_stop_after_turn,
             beforeToolCall=self._before_tool_call,
             afterToolCall=self._after_tool_call,
         )
@@ -191,11 +248,10 @@ class AgentSession:
         self._scoped_models: list[dict[str, Model | ThinkingLevel | None]] | None = None
         self._bind_extension_context({})
 
-        # ── Project-local memory (P5) — flag-gated, default off ───────────────
-        # When settings.json memory_enabled=true or PI_MEMORY_ENABLED=1, attach
-        # the project-local store so the recall hook in _transform_context fires.
-        # Live auto-curation + compaction replacement are validated end-to-end by
-        # P6; default-off keeps existing behaviour unchanged.
+        # ── Project-local memory (P5) — native, with explicit kill switch ─────
+        # Memory is enabled by default; settings.json memory_enabled=false or
+        # PI_MEMORY_DISABLED=1 disables it. PI_MEMORY_ENABLED=1 force-enables it.
+        # When enabled, the recall hook in _transform_context fires.
         self._memory = None
         self._memory_store = None
         self._memory_scope = None
@@ -203,11 +259,27 @@ class AgentSession:
             from .cli_debug_log import log_event
             from .memory.integration import MemoryIntegration, memory_enabled
 
-            # settings.json `memory_enabled` is the normal control plane; env
-            # vars force on for tests/CI and one-off diagnostics.
-            settings_enabled = bool(getattr(self._settings, "memory_enabled", False))
-            env_enabled = memory_enabled()
-            enabled = settings_enabled or env_enabled
+            # settings.json `memory_enabled` is the normal control plane; the
+            # env-var surface (kill switches + force-on) is owned by
+            # `memory_enabled()` — single source of truth for the force-on
+            # branches. When settings.json is silent on memory_enabled, the
+            # runtime defaults to ON.
+            settings_flag = getattr(self._settings, "memory_enabled", None)
+            env_disabled = (
+                os.environ.get("PI_MEMORY_DISABLED", "") == "1"
+                or os.environ.get("PI_CODING_AGENT_MEMORY_DISABLED", "") == "1"
+            )
+            env_forced_on = memory_enabled()
+            if env_disabled:
+                enabled = False
+            elif env_forced_on:
+                enabled = True
+            elif settings_flag is None:
+                enabled = True  # default-on when settings.json is silent
+            else:
+                enabled = bool(settings_flag)
+            settings_enabled = enabled  # for the log_event field names below
+            env_enabled = enabled       # (same effective value, kept for back-compat with log readers)
             memory_root = os.path.abspath(os.path.expanduser(self.cwd))
             log_event(
                 "memory.attach_decision",
@@ -225,6 +297,20 @@ class AgentSession:
                     memory_root, allm_fn=self._memory_acomplete, model=model_name)
                 self._memory_store = self._memory.store
                 self._memory_scope = self._memory.scope
+                # Lane split (§LANES): auto-register the agent-triggered retrieval
+                # tools (memory.summarize_expand, memory.tool_log_lookup) on the
+                # extension runner. Native registration — no extension file or
+                # settings.json entry required. Idempotent.
+                try:
+                    from .memory.tools import register_memory_tools
+                    register_memory_tools(self._extension_runner, self._memory_store)
+                except Exception as exc:
+                    try:
+                        from .cli_debug_log import log_exception
+                        log_exception("memory.tools_registration_failed", exc,
+                                      session_id=self.session_id)
+                    except Exception:
+                        pass
                 log_event(
                     "memory.attached",
                     session_id=self.session_id,
@@ -233,6 +319,29 @@ class AgentSession:
                     scope_project=getattr(self._memory_scope, "project", None),
                     model_id=model_name,
                 )
+                try:
+                    from .memory.dream import run_scheduled_dream
+
+                    dream_result = run_scheduled_dream(memory_root)
+                    log_event(
+                        "memory.dream_checked",
+                        session_id=self.session_id,
+                        memory_root=memory_root,
+                        ran=dream_result.ran,
+                        reason=dream_result.reason,
+                        next_dream_at=dream_result.next_dream_at,
+                        written_count=(
+                            len(dream_result.dream.written_ids)
+                            if dream_result.dream is not None else 0
+                        ),
+                    )
+                except Exception as exc:
+                    try:
+                        from .cli_debug_log import log_exception
+                        log_exception("memory.dream_failed", exc,
+                                      session_id=self.session_id)
+                    except Exception:
+                        pass
         except Exception as exc:
             try:
                 from .cli_debug_log import log_exception
@@ -248,38 +357,150 @@ class AgentSession:
                 pass
             self._memory = None  # never let memory wiring break session construction
         self._memory_cursor = 0  # index of last message curated into memory
+        self._memory_conv_cursor = 0  # index of last message appended to conversation_memory
 
-    def _initial_goal_from_settings(self) -> str | None:
+    def _initial_goal_from_session_vars(self) -> str | None:
+        """Read the goal seed from session_vars only. No disk, no settings file.
+
+        The CLI `--goal <text>` path lands in `session_vars["GOAL"]`; this is
+        where it surfaces at session construction. Goal tools (when enabled)
+        and the prompt assembly read from this same in-memory state.
+        """
         session_vars = self._settings.session_vars or {}
         goal = session_vars.get("GOAL")
         if isinstance(goal, str) and goal.strip():
-            return goal.strip()
+            value = goal.strip()
+            self._goal = SessionGoal(objective=value, status="active")
+            return value
         return None
 
+    @property
+    def goal_state(self) -> SessionGoal | None:
+        """Read-only view of the in-memory session goal. None if no goal is set."""
+        return self._goal
+
+    def _sync_goal_session_var(self) -> None:
+        """Mirror the in-memory goal into session_vars["GOAL"].
+
+        The session_vars entry is the visible side-effect that survives a
+        settings round-trip; it never touches the filesystem.
+        """
+        if self._settings.session_vars is None:
+            self._settings.session_vars = {}
+        if self._goal is not None and self._goal.status == "active":
+            self._settings.session_vars["GOAL"] = self._goal.objective
+        else:
+            self._settings.session_vars.pop("GOAL", None)
+
     def _effective_system_prompt(self) -> str:
-        if not self._current_goal:
+        # Pure in-memory read. No disk I/O.
+        goal = self._goal
+        if goal is None or goal.status != "active":
             return self._base_system_prompt
         return (
             f"{self._base_system_prompt}\n\n"
             "# Active Goal\n\n"
-            f"{self._current_goal}\n\n"
+            f"{goal.objective}\n\n"
             "Treat this as the current session goal until it is cleared or changed."
         )
 
     def set_current_goal(self, goal: str | None) -> str | None:
+        """Pure state mutation on `self._goal`. Never fires the terminator.
+
+        This method is the setter. It is used by:
+          - the CLI `--goal <text>` path (state seed at launch),
+          - the TUI `/goal <text>` path (replace the goal mid-session).
+
+        `set_current_goal(None)` is the same shape: a state mutation, not a
+        completion signal. It does NOT fire `self._goal_terminated`. The
+        rationale: the loop's continuation policy is independent of goal
+        state — sessions run without a goal, with one, or after clearing one.
+        The terminator belongs to a different verb.
+
+        To signal "the goal-phase is over; let the loop exit," callers must
+        use `clear_goal()` (which fires the terminator) or
+        `update_goal_status("complete"|"blocked")` (which fires on a
+        non-active status transition). The TUI `/goal clear` command routes
+        to `clear_goal()` for exactly this reason.
+
+        Why is CLI `--goal ""` a no-op reset but `/goal clear` exits the
+        loop? Same shape of state mutation, opposite loop consequences.
+        Because at launch there's no running loop to terminate, so the
+        asymmetry is the timing — not the user's intent to commit.
+
+        Args:
+            goal: objective string (non-empty) to set, or None/empty to
+                clear the in-memory goal without firing the terminator.
+
+        Returns:
+            The new `get_current_goal()` value (None if no active goal).
+        """
         value = (goal or "").strip()
-        self._current_goal = value or None
-        if self._settings.session_vars is None:
-            self._settings.session_vars = {}
-        if self._current_goal:
-            self._settings.session_vars["GOAL"] = self._current_goal
+        if value:
+            carry_status = (
+                self._goal.status
+                if self._goal is not None
+                and self._goal.status in ("active", "complete", "blocked")
+                else "active"
+            )
+            self._goal = SessionGoal(objective=value, status=carry_status)
         else:
-            self._settings.session_vars.pop("GOAL", None)
-        self._agent.set_system_prompt(self._effective_system_prompt())
+            self._goal = None
+        self._sync_goal_session_var()
+        self._current_goal = self.get_current_goal()
         return self._current_goal
 
+    def update_goal_status(self, status: str) -> None:
+        """Flip the goal's status. No-op if no goal is set.
+
+        Transitions to 'complete' or 'blocked' signal the agent loop to stop
+        after the current turn.
+        """
+        if status not in ("active", "complete", "blocked"):
+            raise ValueError(f"unknown goal status: {status!r}")
+        if self._goal is None:
+            return
+        old_status = self._goal.status
+        self._goal = SessionGoal(objective=self._goal.objective, status=status)
+        self._sync_goal_session_var()
+        self._current_goal = self.get_current_goal()
+        was_active = old_status == "active"
+        became_terminal = status in _GOAL_TERMINAL_STATUSES
+        if was_active and became_terminal:
+            self._mark_goal_terminated()
+
+    def clear_goal(self) -> None:
+        """Drop the goal entirely and signal the loop to stop after this turn."""
+        previous = self._goal
+        self._goal = None
+        self._sync_goal_session_var()
+        self._current_goal = None
+        if previous is not None:
+            self._mark_goal_terminated()
+
     def get_current_goal(self) -> str | None:
-        return self._current_goal
+        if self._goal is not None and self._goal.status == "active":
+            return self._goal.objective
+        return None
+
+    def _mark_goal_terminated(self) -> None:
+        """Signal that the session's goal was cleared or reached a terminal status.
+
+        Once set, the agent loop will exit at the next opportunity instead of
+        continuing autonomously toward a now-irrelevant objective.
+        """
+        self._goal_terminated = True
+
+    async def _should_stop_after_turn(self, turn_context: dict[str, Any]) -> bool:
+        # Enforcement is binary: the goal-loop machinery flips
+        # `self._goal_terminated` when a tool transitions the goal to a
+        # terminal status, and the agent loop honors that flag here.
+        # No prompt-level enforcement. No "Continue working toward..." user
+        # message. The model pursues the goal because the user told it to
+        # in their messages; the goal state on the session is what gives
+        # the loop its stopping decision.
+        del turn_context
+        return bool(self._goal_terminated)
 
     # ── Tool construction ─────────────────────────────────────────────────────
 
@@ -294,6 +515,12 @@ class AgentSession:
             create_find_tool(self.cwd),
             create_ls_tool(self.cwd),
         ]
+        # Goal tools are opt-in: register only when at least one goal tool
+        # name (or the "goal" alias) appears in the active set. Cost is zero
+        # otherwise — no create_goal_tools import, no instance creation.
+        if self._active_names_include_goal_tool():
+            from .tools import create_goal_tools
+            tools.extend(create_goal_tools(self))
         for extension_tool in self._extension_runner.get_all_registered_tools():
             try:
                 tools.append(
@@ -322,7 +549,46 @@ class AgentSession:
 
     def _tools_for_names(self, tool_names: list[str]) -> list[AgentTool]:
         tools_by_name = {tool.name: tool for tool in self._all_tools}
-        return [tools_by_name[name] for name in tool_names if name in tools_by_name]
+        selected = [tools_by_name[name] for name in tool_names if name in tools_by_name]
+        # If "goal" alias was named, expand it to the four goal tool names.
+        if _GOAL_ALIAS in tool_names:
+            for goal_name in _GOAL_TOOL_NAMES_SET:
+                tool = tools_by_name.get(goal_name)
+                if tool is not None and all(existing.name != goal_name for existing in selected):
+                    selected.append(tool)
+        return selected
+
+    def _active_names_include_goal_tool(self) -> bool:
+        """True when any of the active tool names opts a goal tool in.
+
+        Honors both the goal-alias ("goal") and explicit per-tool names.
+        Called only at construction time before the active list has been
+        finalized, so we read from the explicit requested names / settings.
+
+        Settings come from `self._settings_manager` (the disk-loaded
+        SettingsManager), NOT from `self._settings` — the latter is a
+        bare `Settings()` default-constructed by the ctor when no Settings
+        instance is passed in, and so its `tools` field is always None.
+        The manager is what reads <cwd>/.tau/settings.json and the global
+        ~/.tau/agent/settings.json.
+        """
+        names: set[str] = set()
+        initial = getattr(self, "_initial_active_tool_names", None)
+        if initial is not None:
+            names.update(initial)
+        # Settings file's `tools` list is also opt-in source when ctor
+        # didn't pass initial_active_tool_names.
+        manager_settings = (
+            self._settings_manager.get() if self._settings_manager is not None else None
+        )
+        settings_tools = (
+            getattr(manager_settings, "tools", None) if manager_settings is not None else None
+        )
+        if settings_tools:
+            names.update(settings_tools)
+        if not names:
+            return False
+        return bool(names & (_GOAL_TOOL_NAMES_SET | {_GOAL_ALIAS}))
 
     def _build_system_prompt(self, selected_tools: list[str]) -> str:
         loader = self._resource_loader
@@ -472,10 +738,11 @@ class AgentSession:
         Will be connected to ExtensionRunner.emit_context when extension support is added.
         Mirrors the transform_context callback in TypeScript SDK.
         """
+        self._session_manager.refresh_active_compression_refs()
+        messages = self._session_manager.apply_persisted_active_compression(messages)
         if self._extension_runner.has_handlers("context"):
             messages = await self._extension_runner.emit_context(messages)
         # P1: memory recall — inject a tail recall block when a store is attached.
-        # Off by default (store is None) so existing behaviour is unchanged.
         store = getattr(self, "_memory_store", None)
         if store is not None:
             from .memory.recall import build_recall_block, latest_user_query
@@ -556,11 +823,37 @@ class AgentSession:
         context: dict[str, Any],
         signal: asyncio.Event | None = None,
     ) -> dict[str, Any] | None:
-        if not self._extension_runner.has_handlers("tool_result"):
-            return None
+        # Lane split (§LANES): pin tool_name + tool_call_id on the active-compression
+        # chokepoint so the CCR row this tool result produces carries the same id as
+        # the durable record we'll write to tool_log_memory below. Read by the
+        # chokepoint via get_current_compression_tool_*(). The contextvar lives
+        # for the duration of the next outbound model call (and its child tasks).
+        # This MUST run before _record_tool_log so memory and CCR see the same id.
         tool_call = context.get("toolCall") or context.get("tool_call")
         tool_name = getattr(tool_call, "name", "")
         tool_call_id = getattr(tool_call, "id", "")
+        try:
+            from pi_ai import set_current_compression_tool_context
+            set_current_compression_tool_context(
+                tool_name=tool_name or None,
+                tool_call_id=tool_call_id or None,
+            )
+        except Exception:
+            pass
+        # Programmatic write: durable tool_log_memory row. Runs UNCONDITIONALLY
+        # (extension handlers are optional); the cross-link with CCR is the
+        # tool_call_id set just above.
+        try:
+            await self._record_tool_log(context)
+        except Exception as exc:
+            try:
+                from .cli_debug_log import log_exception
+                log_exception("memory.tool_log_write_failed", exc,
+                              session_id=self.session_id)
+            except Exception:
+                pass
+        if not self._extension_runner.has_handlers("tool_result"):
+            return None
         args = context.get("args") or {}
         result = context.get("result")
         is_error = bool(context.get("isError", context.get("is_error", False)))
@@ -597,7 +890,21 @@ class AgentSession:
             if msg is not None:
                 role = getattr(msg, "role", "")
                 if role in ("user", "assistant", "toolResult"):
-                    self._session_manager.append_message(_message_to_dict(msg))
+                    persisted_msg = _message_to_dict(msg)
+                    active_compression_meta = None
+                    if role == "toolResult":
+                        try:
+                            from pi_coding_agent.active_compression.persisted_context import (
+                                compress_message_for_persistence,
+                            )
+
+                            persisted_msg, active_compression_meta = compress_message_for_persistence(persisted_msg)
+                        except Exception:
+                            active_compression_meta = None
+                    self._session_manager.append_message(
+                        persisted_msg,
+                        active_compression=active_compression_meta,
+                    )
                 # Track last assistant message for retry/compaction
                 if role == "assistant":
                     self._last_assistant_msg = msg
@@ -639,6 +946,8 @@ class AgentSession:
                 return
         # Memory write path: curate this turn's new messages into the store (P5).
         await self._curate_turn()
+        # Conversation log (programmatic) — also harness-driven, runs every turn.
+        await self._record_conversation_turns()
         await self._check_compaction(msg)
 
     # ── Memory: live write path (curation) ───────────────────────────────────
@@ -746,6 +1055,124 @@ class AgentSession:
             except Exception:
                 pass
             pass  # curation must never break the turn
+
+    # ── Memory: tool-log + conversation write paths ──────────────────────────
+    #
+    # Lane split (§LANES, see core/memory/LANES.md):
+    #   * tool_log_memory   — durable, project-local, cross-session record of
+    #                         every tool call. Cross-linked with CCR via
+    #                         shared tool_call_id (set in _after_tool_call).
+    #   * conversation_memory — exact conversation log; the agent can
+    #                         expand any compacted slice via
+    #                         memory.summarize_expand.
+    # Both writes are HARNESS-driven (always run), not agent-triggered.
+
+    async def _record_tool_log(self, context: dict[str, Any]) -> None:
+        """Programmatic write: append this tool call's input + output to tool_log_memory.
+
+        Called from ``_after_tool_call`` after every tool execution. Full
+        outputs go here so ``memory.tool_log_lookup(tool_call_id)`` can
+        recover them later without the agent re-issuing the call.
+        Skips silently if memory is disabled.
+        """
+        if self._memory_store is None:
+            return
+        tool_call = context.get("toolCall") or context.get("tool_call")
+        tool_name = getattr(tool_call, "name", "") or ""
+        tool_call_id = getattr(tool_call, "id", "") or ""
+        if not tool_name or not tool_call_id:
+            return
+        args = context.get("args") or {}
+        result = context.get("result")
+        output_text = ""
+        try:
+            content = (result.get("content", []) if isinstance(result, dict)
+                       else getattr(result, "content", []) or [])
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text" and block.get("text"):
+                        parts.append(str(block["text"]))
+                else:
+                    text = getattr(block, "text", None)
+                    if text:
+                        parts.append(str(text))
+            output_text = "\n".join(parts) if parts else ""
+            details = (result.get("details") if isinstance(result, dict)
+                       else getattr(result, "details", None))
+            if details is not None and not output_text:
+                try:
+                    output_text = json.dumps(_safe_json(details), ensure_ascii=False)[:8000]
+                except Exception:
+                    output_text = str(details)[:8000]
+        except Exception:
+            output_text = ""
+        try:
+            self._memory_store.record_tool_log(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                tool_args=args if isinstance(args, (dict, str)) else str(args),
+                output=output_text[:32_000],  # cap to keep the row bounded
+            )
+        except Exception as exc:
+            try:
+                from .cli_debug_log import log_exception
+                log_exception("memory.tool_log_write_failed", exc,
+                              session_id=self.session_id,
+                              tool_call_id=tool_call_id, tool_name=tool_name)
+            except Exception:
+                pass
+
+    async def _record_conversation_turns(self) -> None:
+        """Append every new user_turn / assistant_output to conversation_memory.
+
+        Thread-id is the agent session_id so each session gets its own
+        conversational history. This is the HARNESS-side write — the
+        agent never invokes this method; the runtime calls it after
+        every turn completes (mirrors Oracle's programmatic write path).
+        """
+        if self._memory_store is None:
+            return
+        try:
+            from .memory.models import ConversationTurn
+        except Exception:
+            return
+        msgs = self._agent.state.messages
+        start = self._memory_conv_cursor
+        self._memory_conv_cursor = len(msgs)
+        thread_id = self.session_id or ""
+        written = 0
+        for i, m in enumerate(msgs[start:], start=start):
+            role = getattr(m, "role", "")
+            if role not in ("user", "assistant"):
+                continue
+            text = _message_text(m)
+            if not text:
+                continue
+            try:
+                self._memory_store.append_turn(ConversationTurn(
+                    id="", project="", role=role, content=text,
+                    scope_id=thread_id,
+                ))
+                written += 1
+            except Exception as exc:
+                try:
+                    from .cli_debug_log import log_exception
+                    log_exception("memory.conversation_write_failed", exc,
+                                  session_id=self.session_id, msg_index=i)
+                except Exception:
+                    pass
+        if written:
+            try:
+                from .cli_debug_log import log_event
+                log_event(
+                    "memory.conversation_written",
+                    session_id=self.session_id,
+                    thread_id=thread_id,
+                    written=written,
+                )
+            except Exception:
+                pass
 
     def _emit(self, event: dict | Any) -> None:
         """Emit a synthetic session event to all listeners."""
@@ -1100,6 +1527,275 @@ class AgentSession:
         forked_sm = self._session_manager.branch(branch_point, self.cwd)
         await self._switch_to_session_manager(forked_sm)
         return {"cancelled": False, "selectedText": selected_text}
+
+    async def recover_session(self, target: str | int | None = None) -> dict[str, Any]:
+        """
+        Recover from a failed tail by branching before it and injecting a checkpoint.
+
+        `target` can be:
+        - None, "last", or "1": most recent failure
+        - "2", "3", ...: nth most recent failure
+        - an entry id: recover from that exact entry
+        """
+        entries = self._session_manager.get_entries()
+        if not entries:
+            return {"cancelled": True, "reason": "empty_session"}
+
+        source = self._select_recovery_source(entries, target)
+        if source is None:
+            return {"cancelled": True, "reason": "no_failure_found"}
+
+        branch_point_id = self._recovery_branch_point(entries, source)
+        source_index = next((i for i, entry in enumerate(entries) if entry.id == source.id), -1)
+        branch_index = (
+            next((i for i, entry in enumerate(entries) if entry.id == branch_point_id), -1)
+            if branch_point_id
+            else -1
+        )
+        dropped = [
+            entry.id
+            for entry in entries[branch_index + 1:source_index + 1]
+            if entry.id
+        ]
+        preserved = [entry.id for entry in entries[:branch_index + 1] if entry.id]
+        reason = self._classify_recovery_reason(source)
+        summary = self._build_recovery_summary(entries, source, reason, branch_point_id, dropped)
+
+        recovered_sm = self._session_manager.branch(branch_point_id, self.cwd)
+        recovery_entry_id = recovered_sm.append_recovery(
+            summary,
+            reason=reason,
+            source_entry_id=source.id,
+            branch_point_id=branch_point_id,
+            dropped_entry_ids=dropped,
+            preserved_entry_ids=preserved[-12:],
+            details={
+                "target": str(target or "last"),
+                "sourceType": source.type,
+                "sourceTimestamp": source.timestamp,
+            },
+        )
+        old_session_id = self.session_id
+        await self._switch_to_session_manager(recovered_sm)
+        return {
+            "cancelled": False,
+            "reason": reason,
+            "sourceEntryId": source.id,
+            "branchPointId": branch_point_id,
+            "recoveryEntryId": recovery_entry_id,
+            "droppedEntryIds": dropped,
+            "oldSessionId": old_session_id,
+            "newSessionId": self.session_id,
+            "summary": summary,
+        }
+
+    def _select_recovery_source(
+        self,
+        entries: list[SessionEntry],
+        target: str | int | None,
+    ) -> SessionEntry | None:
+        if isinstance(target, str):
+            raw = target.strip()
+            if raw and raw not in {"last", "latest"} and not raw.isdigit():
+                return self._session_manager.get_entry(raw)
+            target = raw or None
+
+        failures = [entry for entry in entries if self._is_recovery_failure(entry)]
+        if not failures:
+            return None
+        index = 1
+        if isinstance(target, int):
+            index = target
+        elif isinstance(target, str) and target.isdigit():
+            index = int(target)
+        index = max(1, index)
+        if index > len(failures):
+            return None
+        return list(reversed(failures))[index - 1]
+
+    def _is_recovery_failure(self, entry: SessionEntry) -> bool:
+        text = self._entry_text(entry).lower()
+        msg = entry.data.get("message", {})
+        if isinstance(msg, dict):
+            if msg.get("stop_reason") == "error" or msg.get("stopReason") == "error":
+                return True
+            if msg.get("error_message") or msg.get("errorMessage"):
+                return True
+            if msg.get("is_error") or msg.get("isError"):
+                return True
+            details = msg.get("details")
+            if isinstance(details, dict) and details.get("kind") == "tool_error":
+                return True
+        return any(
+            needle in text
+            for needle in (
+                "context_length_exceeded",
+                "context window",
+                "traceback",
+                "timeouterror",
+                "timed out",
+                "command exited with code 1",
+                "error code:",
+            )
+        )
+
+    def _recovery_branch_point(
+        self,
+        entries: list[SessionEntry],
+        source: SessionEntry,
+    ) -> str | None:
+        by_id = {entry.id: entry for entry in entries}
+        parent = by_id.get(source.parent_id) if source.parent_id else None
+        if parent and self._entry_is_tool_result(parent):
+            grandparent = by_id.get(parent.parent_id) if parent.parent_id else None
+            if grandparent and self._entry_has_tool_call(grandparent):
+                return grandparent.parent_id
+            return parent.parent_id
+        if self._entry_is_tool_result(source):
+            parent = by_id.get(source.parent_id) if source.parent_id else None
+            if parent and self._entry_has_tool_call(parent):
+                return parent.parent_id
+            return source.parent_id
+        return source.parent_id
+
+    def _classify_recovery_reason(self, entry: SessionEntry) -> str:
+        text = self._entry_text(entry).lower()
+        if "context_length_exceeded" in text or "context window" in text:
+            return "context_length_exceeded"
+        if "timed out" in text or "timeouterror" in text:
+            return "timeout"
+        if "traceback" in text:
+            return "exception"
+        msg = entry.data.get("message", {})
+        if isinstance(msg, dict):
+            details = msg.get("details")
+            if isinstance(details, dict) and details.get("kind") == "tool_error":
+                return "tool_error"
+            if msg.get("stop_reason") == "error" or msg.get("stopReason") == "error":
+                return "model_error"
+        return "failure"
+
+    def _build_recovery_summary(
+        self,
+        entries: list[SessionEntry],
+        source: SessionEntry,
+        reason: str,
+        branch_point_id: str | None,
+        dropped_entry_ids: list[str],
+    ) -> str:
+        recent_user = [
+            self._entry_text(entry)
+            for entry in entries
+            if entry.type == "message"
+            and isinstance(entry.data.get("message"), dict)
+            and entry.data["message"].get("role") == "user"
+            and self._entry_text(entry).strip()
+        ][-4:]
+        branch_index = (
+            next((i for i, entry in enumerate(entries) if entry.id == branch_point_id), -1)
+            if branch_point_id
+            else -1
+        )
+        preserved_entries = entries[:branch_index + 1] if branch_index >= 0 else []
+        useful_tool_outputs = [
+            self._summarize_tool_result(entry)
+            for entry in preserved_entries
+            if self._entry_is_tool_result(entry) and not self._is_recovery_failure(entry)
+        ]
+        useful_tool_outputs = [text for text in useful_tool_outputs if text][-4:]
+        failure_excerpt = self._clip_text(self._entry_text(source), 1200)
+
+        lines = [
+            "## Recovery Point",
+            f"Recovered from `{reason}` at entry `{source.id}`.",
+            "",
+            "## Failure",
+            failure_excerpt or "(no failure text captured)",
+            "",
+            "## Preserved Context",
+        ]
+        if recent_user:
+            lines.append("Recent user requests:")
+            lines.extend(f"- {self._clip_text(item, 240)}" for item in recent_user)
+        else:
+            lines.append("- No recent user request text found.")
+        if useful_tool_outputs:
+            lines.append("")
+            lines.append("Recent successful tool evidence:")
+            lines.extend(f"- {item}" for item in useful_tool_outputs)
+        lines.extend([
+            "",
+            "## Dropped Tail",
+            f"- Branch point: `{branch_point_id or 'session-root'}`",
+            f"- Dropped entries: {', '.join(dropped_entry_ids) if dropped_entry_ids else '(none)'}",
+            "",
+            "## Next Step",
+            "Continue from the preserved branch. Treat the failure above as diagnostic evidence, "
+            "but do not re-load the dropped raw tool output unless it is specifically needed.",
+        ])
+        return "\n".join(lines)
+
+    def _entry_text(self, entry: SessionEntry) -> str:
+        msg = entry.data.get("message", {})
+        if isinstance(msg, dict):
+            parts: list[str] = []
+            err = msg.get("error_message") or msg.get("errorMessage")
+            if err:
+                parts.append(str(err))
+            content = msg.get("content", [])
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        if isinstance(block.get("text"), str):
+                            parts.append(block["text"])
+                        elif isinstance(block.get("thinking"), str):
+                            parts.append(block["thinking"])
+                        elif block.get("type") in {"toolCall", "tool_call"}:
+                            parts.append(str(block.get("name") or "tool_call"))
+                            arguments = block.get("arguments") or block.get("input")
+                            if arguments is not None:
+                                try:
+                                    parts.append(json.dumps(arguments, ensure_ascii=False))
+                                except TypeError:
+                                    parts.append(str(arguments))
+            return "\n".join(parts)
+        if entry.type in {"branch_summary", "recovery", "compaction"}:
+            summary = entry.data.get("summary")
+            return str(summary or "")
+        if entry.type == "custom_message":
+            return str(entry.data.get("content") or "")
+        return ""
+
+    def _entry_is_tool_result(self, entry: SessionEntry) -> bool:
+        msg = entry.data.get("message", {})
+        return isinstance(msg, dict) and msg.get("role") == "toolResult"
+
+    def _entry_has_tool_call(self, entry: SessionEntry) -> bool:
+        msg = entry.data.get("message", {})
+        if not isinstance(msg, dict):
+            return False
+        content = msg.get("content", [])
+        return isinstance(content, list) and any(
+            isinstance(block, dict) and block.get("type") in {"toolCall", "tool_call"}
+            for block in content
+        )
+
+    def _summarize_tool_result(self, entry: SessionEntry) -> str:
+        text = self._entry_text(entry)
+        if not text.strip():
+            return ""
+        first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        if not first_line:
+            return ""
+        return self._clip_text(first_line, 220)
+
+    def _clip_text(self, text: str, limit: int) -> str:
+        cleaned = " ".join(str(text).split())
+        if len(cleaned) <= limit:
+            return cleaned
+        return cleaned[: max(0, limit - 3)] + "..."
 
     def get_session_tree_entries(self) -> list[dict[str, Any]]:
         """Return a flat session-tree listing for RPC/TUI fallback commands."""
@@ -2523,6 +3219,7 @@ class AgentSession:
     newSession = new_session
     cloneSession = clone_session
     forkSession = fork_session
+    recoverSession = recover_session
     getSessionTreeEntries = get_session_tree_entries
     navigateTree = navigate_tree
     getSteeringMessages = get_steering_messages
@@ -2607,3 +3304,30 @@ def _message_text(msg: Any) -> str:
         else:
             parts.append(getattr(b, "text", "") or getattr(b, "thinking", "") or "")
     return "\n".join(p for p in parts if p)
+
+
+def _safe_json(obj: Any) -> Any:
+    """Best-effort JSON-safe coercion for tool_log writes.
+
+    Pydantic models → model_dump(mode='json'); dataclasses → __dict__;
+    other objects → str. Tuples → lists. Never raises — returns a
+    fallback string if all else fails, so the log row never blocks
+    tool execution.
+    """
+    try:
+        if hasattr(obj, "model_dump"):
+            return obj.model_dump(mode="json")
+        if isinstance(obj, dict):
+            return {k: _safe_json(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_safe_json(v) for v in obj]
+        if isinstance(obj, (str, int, float, bool)) or obj is None:
+            return obj
+        return str(obj)
+    except Exception:
+        try:
+            return str(obj)
+        except Exception:
+            return "<unserializable>"
+        except Exception:
+            return "<unserializable>"
