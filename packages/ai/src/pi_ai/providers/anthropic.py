@@ -13,6 +13,8 @@ Full parity including:
 """
 from __future__ import annotations
 
+import asyncio
+import os
 import re
 import time
 from typing import Any, AsyncGenerator
@@ -411,6 +413,70 @@ def _make_empty_assistant(model: Model) -> AssistantMessage:
     )
 
 
+def _provider_stream_idle_timeout_seconds(model: Model) -> float | None:
+    """Bound silent MiniMax streams while leaving official Anthropic unchanged."""
+    configured = os.environ.get("TAU_PROVIDER_STREAM_IDLE_TIMEOUT_SECONDS")
+    if configured is not None:
+        try:
+            value = float(configured)
+        except ValueError:
+            return None
+        return value if value > 0 else None
+    if str(getattr(model, "provider", "")).lower() == "minimax":
+        return 30.0
+    return None
+
+
+async def _iter_provider_events_with_idle_retry(
+    initial_stream: Any,
+    client: Any,
+    params: dict[str, Any],
+    model: Model,
+    state: dict[str, Any],
+) -> AsyncGenerator[Any, None]:
+    """Retry one MiniMax request only when its stream emits no events at all."""
+    idle_timeout = _provider_stream_idle_timeout_seconds(model)
+
+    async def consume(stream: Any) -> AsyncGenerator[Any, None]:
+        saw_event = False
+        iterator = stream.__aiter__()
+        while True:
+            try:
+                if idle_timeout is None:
+                    event = await anext(iterator)
+                else:
+                    event = await asyncio.wait_for(
+                        anext(iterator), timeout=idle_timeout
+                    )
+            except StopAsyncIteration:
+                try:
+                    state["final_message"] = await stream.get_final_message()
+                except Exception as exc:  # preserve the adapter's partial fallback
+                    state["final_message_error"] = exc
+                state["completed"] = True
+                return
+            except asyncio.TimeoutError:
+                if saw_event:
+                    raise
+                return
+            saw_event = True
+            yield event
+
+    async for event in consume(initial_stream):
+        yield event
+    if state.get("completed"):
+        return
+
+    state["idle_retries"] = 1
+    async with client.messages.stream(**params) as retry_stream:
+        async for event in consume(retry_stream):
+            yield event
+    if not state.get("completed"):
+        raise TimeoutError(
+            f"Provider stream remained idle for {idle_timeout:g}s after one retry"
+        )
+
+
 async def stream_simple(
     model: Model,
     context: Context,
@@ -497,6 +563,7 @@ async def stream_simple(
     raw_response_events: list[Any] = []
     final_response_message: Any | None = None
     response_notified = False
+    stream_state: dict[str, Any] = {"idle_retries": 0, "completed": False}
 
     async def notify_response() -> None:
         """Expose the raw SDK response once, including partial failed streams."""
@@ -509,6 +576,7 @@ async def stream_simple(
             {
                 "events": list(raw_response_events),
                 "final_message": final_response_message,
+                "idle_retries": stream_state["idle_retries"],
             },
             model,
         )
@@ -711,7 +779,11 @@ async def stream_simple(
 
             # Get final message from stream
             try:
-                final_response_message = await ant_stream.get_final_message()
+                if stream_state.get("final_message_error") is not None:
+                    raise stream_state["final_message_error"]
+                final_response_message = stream_state.get("final_message")
+                if final_response_message is None:
+                    raise RuntimeError("Provider stream did not return a final message")
                 u = final_response_message.usage
                 usage = Usage(
                     input=u.input_tokens,
