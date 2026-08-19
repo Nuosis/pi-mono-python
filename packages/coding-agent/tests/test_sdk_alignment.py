@@ -1195,6 +1195,118 @@ class TestSDKAlignment:
         assert session._session_manager.get_leaf_id() == first_id
 
     @pytest.mark.asyncio
+    async def test_recover_session_branches_before_context_overflow_tail(self, tmp_path):
+        result = await create_agent_session(
+            CreateAgentSessionOptions(
+                cwd=str(tmp_path),
+                model=get_model("anthropic", "claude-3-5-sonnet-20241022"),
+                resource_loader=_FakeResourceLoader(),
+            )
+        )
+        session = result.session
+        user_id = session._session_manager.append_message({
+            "role": "user",
+            "content": "Investigate the TauClaire timeout",
+            "timestamp": 1,
+        })
+        tool_call_id = session._session_manager.append_message({
+            "role": "assistant",
+            "content": [{
+                "type": "toolCall",
+                "name": "bash",
+                "arguments": {"command": "run huge eval"},
+            }],
+            "stop_reason": "toolUse",
+            "timestamp": 2,
+        })
+        tool_result_id = session._session_manager.append_message({
+            "role": "toolResult",
+            "content": [{"type": "text", "text": "SQL log line\n" * 5000}],
+            "timestamp": 3,
+        })
+        error_id = session._session_manager.append_message({
+            "role": "assistant",
+            "content": [],
+            "stop_reason": "error",
+            "error_message": (
+                "Error Code context_length_exceeded: Your input exceeds the "
+                "context window of this model."
+            ),
+            "timestamp": 4,
+        })
+        old_id = session.session_id
+
+        recover_result = await session.recover_session()
+
+        assert recover_result["cancelled"] is False
+        assert recover_result["reason"] == "context_length_exceeded"
+        assert recover_result["sourceEntryId"] == error_id
+        assert recover_result["branchPointId"] == user_id
+        assert recover_result["oldSessionId"] == old_id
+        assert recover_result["newSessionId"] != old_id
+        assert recover_result["droppedEntryIds"] == [tool_call_id, tool_result_id, error_id]
+        assert "TauClaire timeout" in recover_result["summary"]
+        assert "context_length_exceeded" in recover_result["summary"]
+
+        entries = session._session_manager.get_entries()
+        assert entries[-1].type == "recovery"
+        assert session._session_manager.get_leaf_id() == recover_result["recoveryEntryId"]
+        rendered = session.messages
+        assert rendered[0]["role"] == "user"
+        assert rendered[0]["content"] == "Investigate the TauClaire timeout"
+        assert rendered[-1]["role"] == "user"
+        assert "Recovery checkpoint" in rendered[-1]["content"][0]["text"]
+        assert "SQL log line" not in json.dumps(rendered)
+
+    @pytest.mark.asyncio
+    async def test_recover_session_accepts_numbered_tool_error(self, tmp_path):
+        result = await create_agent_session(
+            CreateAgentSessionOptions(
+                cwd=str(tmp_path),
+                model=get_model("anthropic", "claude-3-5-sonnet-20241022"),
+                resource_loader=_FakeResourceLoader(),
+            )
+        )
+        session = result.session
+        first_user = session._session_manager.append_message({
+            "role": "user",
+            "content": "First task",
+            "timestamp": 1,
+        })
+        session._session_manager.append_message({
+            "role": "assistant",
+            "content": [{"type": "toolCall", "name": "bash", "arguments": {"command": "bad"}}],
+            "stop_reason": "toolUse",
+            "timestamp": 2,
+        })
+        first_error = session._session_manager.append_message({
+            "role": "toolResult",
+            "content": [{"type": "text", "text": "Command exited with code 1"}],
+            "details": {"kind": "tool_error"},
+            "is_error": True,
+            "timestamp": 3,
+        })
+        session._session_manager.append_message({
+            "role": "user",
+            "content": "Second task",
+            "timestamp": 4,
+        })
+        session._session_manager.append_message({
+            "role": "assistant",
+            "content": [],
+            "stop_reason": "error",
+            "error_message": "TimeoutError: TauClaire timed out. stderr=",
+            "timestamp": 5,
+        })
+
+        recover_result = await session.recover_session("2")
+
+        assert recover_result["cancelled"] is False
+        assert recover_result["sourceEntryId"] == first_error
+        assert recover_result["reason"] == "tool_error"
+        assert recover_result["branchPointId"] == first_user
+
+    @pytest.mark.asyncio
     async def test_session_tree_entries_and_navigation_contract(self, tmp_path):
         result = await create_agent_session(
             CreateAgentSessionOptions(
@@ -1369,9 +1481,15 @@ class TestSDKAlignment:
         )
         session = result.session
         task = asyncio.create_task(
-            session.execute_bash("python -c 'import time; time.sleep(10)'")
+            session.execute_bash(f"{sys.executable} -c 'import time; time.sleep(10)'")
         )
-        await asyncio.sleep(0.1)
+        # Poll for the bash to actually start — the execute_bash task may
+        # not have set _bash_cancel_event within a fixed 0.1s window
+        # (subprocess spawn, async scheduling, etc.). Bound the wait.
+        for _ in range(50):
+            if session.is_bash_running:
+                break
+            await asyncio.sleep(0.05)
         assert session.is_bash_running is True
 
         session.abort_bash()
@@ -4081,7 +4199,16 @@ class TestDefaultValues:
         themes = {Path(item.path).name: item.enabled for item in resolved.themes}
 
         assert extensions == {"a.py": True, "b.py": False}
-        assert skills == {"a.md": False, "b.md": False}
+        # Always-on bundled skills (e.g. the bundled agent-build-pattern's SKILL.md)
+        # may also resolve; the test cares that the package's own resources
+        # are present and correctly enabled/disabled. Filter the package's
+        # resources (origin == 'package') before asserting.
+        package_skills = {
+            Path(item.path).name: item.enabled
+            for item in resolved.skills
+            if item.metadata.origin == "package"
+        }
+        assert package_skills == {"a.md": False, "b.md": False}
         assert prompts == {"p.md": True}
         assert themes == {"t.json": True}
         assert all(item.metadata.source == str(package) for item in resolved.extensions)
@@ -4153,10 +4280,21 @@ class TestDefaultValues:
 
         resolved = await manager.resolve()
 
-        assert len(resolved.skills) == 1
-        skill = resolved.skills[0]
+        # Filter to the test's own resources (scope=project, source=local,
+        # origin=top-level) to avoid bundled skill auto-inclusion polluting
+        # the count. The original test assumed resolved.skills[0] was the
+        # test's own skill — that's no longer true with always-on bundled
+        # skills in the list.
+        test_skills = [
+            s for s in resolved.skills
+            if getattr(s.metadata, "scope", None) == "project"
+            and getattr(s.metadata, "source", None) == "local"
+            and getattr(s.metadata, "origin", None) == "top-level"
+        ]
+        assert len(test_skills) == 1
+        skill = test_skills[0]
         assert skill.path == str(shared)
-        assert skill.enabled is False
+        assert skill.enabled is False  # disabled by "!shared.md"
         assert skill.metadata.scope == "project"
         assert skill.metadata.source == "local"
         assert skill.metadata.origin == "top-level"
@@ -4454,7 +4592,12 @@ class TestDefaultValues:
         (agent_dir / "AGENTS.md").write_text("global context", encoding="utf-8")
         (project / "CLAUDE.md").write_text("project context", encoding="utf-8")
 
-        loaded = pi_coding_agent.loadProjectContextFiles(str(child), str(agent_dir))
+        # Default behavior is deny-by-default: only the agent_dir AGENTS.md
+        # is loaded. Pass project_trusted=True (and walk_ancestors=True) to
+        # opt in to project-scope context (the CLAUDE.md at the project root).
+        loaded = pi_coding_agent.loadProjectContextFiles(
+            str(child), str(agent_dir), project_trusted=True, walk_ancestors=True,
+        )
 
         assert [item["content"] for item in loaded] == ["global context", "project context"]
         untrusted_loaded = pi_coding_agent.loadProjectContextFiles(str(child), str(agent_dir), False)
@@ -4471,6 +4614,8 @@ class TestDefaultValues:
         uppercase_loaded = pi_coding_agent.loadProjectContextFiles(
             str(uppercase_child),
             str(uppercase_agent_dir),
+            project_trusted=True,
+            walk_ancestors=True,
         )
 
         assert [item["content"] for item in uppercase_loaded] == ["uppercase global", "uppercase project"]
@@ -4819,11 +4964,14 @@ class TestDefaultValues:
 
     @pytest.mark.asyncio
     async def test_thinking_level_default_medium(self):
-        """Test thinking_level defaults to 'medium' (not 'off')."""
+        """Test thinking_level defaults to a known valid level (may be clamped
+        to 'off' if the model doesn't support reasoning, or 'adaptive' for
+        Anthropic Opus 4.6+)."""
+        from pi_coding_agent.cli_sub.args import VALID_THINKING_LEVELS
         result = await create_agent_session()
         session = result.session
-        
-        # Default should be 'medium' (may be clamped to 'off' if model doesn't support reasoning)
-        # Check the settings object
-        # Note: actual thinking_level may be 'off' if model doesn't support reasoning
-        assert session._settings.thinking_level in ["off", "medium", "low", "minimal", "high"]
+
+        # The resolved level must be one of the runtime-valid levels.
+        # Allowed: VALID_THINKING_LEVELS (off/minimal/low/medium/high/xhigh/adaptive)
+        # plus 'off' is the fallback when the model doesn't support reasoning.
+        assert session._settings.thinking_level in set(VALID_THINKING_LEVELS) | {"off"}

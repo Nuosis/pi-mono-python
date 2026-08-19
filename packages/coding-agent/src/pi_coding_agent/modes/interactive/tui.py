@@ -510,7 +510,7 @@ def _loaded_resource_lines(session: Any, *, show_listing: bool = True, show_diag
         extension_diagnostics.extend(_built_in_command_conflict_diagnostics(
             extension_runner,
             {
-                "settings", "chat", "model", "models", "set", "scoped-models", "export", "import", "share", "copy", "name",
+                "settings", "chat", "model", "models", "set", "scoped-models", "export", "import", "share", "feedback", "copy", "name",
                 "session", "changelog", "hotkeys", "fork", "clone", "tree", "trust", "login",
                 "logout", "new", "compact", "resume", "reload", "quit", "exit", "clear",
                 "help", "thinking", "tools",
@@ -767,7 +767,13 @@ async def _run_pi_tui(
 
     def assistant_rendered_line(text: str) -> str:
         label = _assistant_label(session)
+        text = _strip_think_tags(text).strip()
         return f"{bold(label)}\n{render_markdown(text)}"
+
+    def _strip_think_tags(text: str) -> str:
+        text = re.sub(r"(?is)<think\b[^>]*>.*?</think>", "", text)
+        text = re.sub(r"(?is)</?think\b[^>]*>", "", text)
+        return text
 
     # ── Output area ──────────────────────────────────────────────────────────
     header_text = Text("", padding_x=1, padding_y=0)
@@ -802,7 +808,7 @@ async def _run_pi_tui(
                 text = getattr(item, "text", "")
                 if isinstance(text, str) and text:
                     parts.append(text)
-        return "".join(parts)
+        return _strip_think_tags("".join(parts)).strip()
 
     def message_text_from_any(message: Any) -> tuple[str, str]:
         if isinstance(message, dict):
@@ -812,7 +818,7 @@ async def _run_pi_tui(
             role = str(getattr(message, "role", ""))
             content = getattr(message, "content", "")
         if isinstance(content, str):
-            return role, content
+            return role, _strip_think_tags(content).strip()
         if isinstance(content, list):
             parts: list[str] = []
             for item in content:
@@ -821,7 +827,7 @@ async def _run_pi_tui(
                         parts.append(str(item.get("text", "")))
                 elif getattr(item, "type", None) == "text":
                     parts.append(str(getattr(item, "text", "")))
-            return role, "".join(parts)
+            return role, _strip_think_tags("".join(parts)).strip()
         return role, ""
 
     def rebuild_history_from_current_session() -> None:
@@ -837,12 +843,9 @@ async def _run_pi_tui(
             if not body:
                 continue
             if role == "user":
-                blocks.append(_user_box(body))
+                blocks.append(f"{bold('User')}\n{render_markdown(body)}")
             elif role == "assistant":
                 blocks.append(assistant_rendered_line(body))
-            else:
-                label = role or "Message"
-                blocks.append(f"{label}: {body}")
         history_text.set_text("\n\n".join(blocks))
         history_text.invalidate()
 
@@ -1060,6 +1063,7 @@ async def _run_pi_tui(
         ("export", "Export session as HTML"),
         ("import", "Import and resume a session"),
         ("share", "Share session"),
+        ("feedback", "Submit feedback"),
         ("copy", "Copy last assistant message"),
         ("name", "Set session display name"),
         ("session", "Show session statistics"),
@@ -1563,11 +1567,13 @@ async def _run_pi_tui(
                 f"  {cyan('/chat')}     — Render the session chat transcript",
                 f"  {cyan('/goal')}     — Show, set, or clear current session goal",
                 f"  {cyan('/model')}    — List available models / switch model",
+                f"  {cyan('/feedback')} — Submit a bug report or feature request",
                 f"  {cyan('/copy')}     — Copy last assistant message",
                 f"  {cyan('/name')}     — Set session display name",
                 f"  {cyan('/export')}   — Export session as HTML or JSONL",
                 f"  {cyan('/new')}      — Clear conversation and start a fresh session view",
                 f"  {cyan('/reload')}   — Reload settings and resources",
+                f"  {cyan('/recover')}  — Branch before a failed tail and inject a recovery checkpoint",
                 f"  {cyan('/compact')}  — Compact context to free tokens",
                 f"  {cyan('/kill')}     — Kill running tau sessions and subagents",
                 f"  {cyan('/thinking')} — Cycle thinking level",
@@ -1595,6 +1601,20 @@ async def _run_pi_tui(
             except Exception as exc:
                 append_history(f"{red('Copy failed:')} {exc}")
             tui.request_render()
+            return
+
+        if stripped == "/feedback" or stripped.startswith("/feedback "):
+            await _handle_feedback_command(
+                stripped,
+                session,
+                append_history,
+                tui,
+                show_extension_selector,
+                show_extension_input,
+                dim,
+                red,
+                green,
+            )
             return
 
         if stripped == "/new":
@@ -1756,6 +1776,39 @@ async def _run_pi_tui(
                         append_history(green("Navigated session tree."))
                 except Exception as exc:
                     append_history(f"{red('Tree navigation failed:')} {exc}")
+            update_footer()
+            tui.request_render()
+            return
+
+        if stripped == "/recover" or stripped.startswith("/recover "):
+            target = stripped[9:].strip() if stripped.startswith("/recover ") else None
+            try:
+                recover = getattr(session, "recover_session", None) or getattr(session, "recoverSession", None)
+                if not callable(recover):
+                    raise RuntimeError("Recovery is not supported by this session")
+                result = await recover(target)
+                if result.get("cancelled"):
+                    reason = result.get("reason") or "unknown"
+                    append_history(dim(f"Recovery cancelled: {reason}."))
+                else:
+                    dropped = result.get("droppedEntryIds") or []
+                    lines = [
+                        green("Recovered session."),
+                        f"  Reason:        {result.get('reason')}",
+                        f"  Source entry:  {result.get('sourceEntryId')}",
+                        f"  Recovery:      {result.get('recoveryEntryId')}",
+                        f"  New session:   {result.get('newSessionId')}",
+                        f"  Dropped tail:  {len(dropped)} entr{'y' if len(dropped) == 1 else 'ies'}",
+                    ]
+                    summary = str(result.get("summary") or "")
+                    if summary:
+                        short = summary[:600] + "..." if len(summary) > 600 else summary
+                        lines.append("")
+                        lines.append(dim(short))
+                    append_history("\n".join(lines))
+                    rebuild_history_from_current_session()
+            except Exception as exc:
+                append_history(f"{red('Recover failed:')} {exc}")
             update_footer()
             tui.request_render()
             return
@@ -2594,6 +2647,91 @@ async def _handle_login_command(
     tui.request_render()
 
 
+async def _handle_feedback_command(
+    stripped: str,
+    session: "AgentSession",
+    append_history,
+    tui,
+    show_select,
+    show_input,
+    dim,
+    red,
+    green,
+) -> None:
+    from pi_coding_agent.core.feedback import (
+        FeedbackError,
+        FeedbackRequest,
+        collect_session_snapshot,
+        parse_feedback_args,
+        submit_github_issue,
+    )
+
+    args = stripped[len("/feedback"):].strip()
+    try:
+        request = parse_feedback_args(args)
+    except FeedbackError as exc:
+        append_history(f"{red('Feedback failed:')} {exc}")
+        tui.request_render()
+        return
+
+    if request is None:
+        if show_select is None or show_input is None:
+            append_history(dim('Usage: /feedback <bug|feature> <yes|no> "<issue/request>" ["expected behavior"]'))
+            tui.request_render()
+            return
+
+        selected_type = await show_select("Feedback type", ["Bug", "Feature request"], None)
+        if selected_type is None:
+            append_history(dim("Feedback cancelled."))
+            tui.request_render()
+            return
+        include_session_value = await show_select("Include session?", ["Yes", "No"], None)
+        if include_session_value is None:
+            append_history(dim("Feedback cancelled."))
+            tui.request_render()
+            return
+        issue = await show_input("What's the issue/request?", "Describe the issue or request", None)
+        if issue is None or not issue.strip():
+            append_history(dim("Feedback cancelled."))
+            tui.request_render()
+            return
+        expected = None
+        if str(selected_type).lower().startswith("bug"):
+            expected = await show_input(
+                "What would you like to have happened instead?",
+                "Expected behavior",
+                None,
+            )
+            if expected is None or not expected.strip():
+                append_history(dim("Feedback cancelled."))
+                tui.request_render()
+                return
+        request = FeedbackRequest(
+            feedback_type="bug" if str(selected_type).lower().startswith("bug") else "feature",
+            include_session=str(include_session_value).lower().startswith("y"),
+            issue=issue,
+            expected=expected,
+        )
+
+    if request.include_session:
+        request = FeedbackRequest(
+            feedback_type=request.feedback_type,
+            include_session=True,
+            issue=request.issue,
+            expected=request.expected,
+            session_snapshot=collect_session_snapshot(session),
+        )
+
+    try:
+        submitted = await asyncio.to_thread(submit_github_issue, request)
+    except FeedbackError as exc:
+        append_history(f"{red('Feedback failed:')} {exc}")
+    else:
+        label = f" #{submitted.number}" if submitted.number is not None else ""
+        append_history(f"{green('Feedback submitted')}{label}: {submitted.url}")
+    tui.request_render()
+
+
 async def _handle_logout_command(
     stripped: str,
     session: "AgentSession",
@@ -2763,7 +2901,62 @@ def _store_tier_config(provider: str, strength: str, model_id: str, thinking_lev
         "model": model_id,
         "thinkingLevel": thinking_level or "off",
     }
+    _upsert_known_model_metadata(provider, provider_config, model_id)
     _write_models_config(models_path, config)
+
+
+_KNOWN_PROVIDER_MODEL_METADATA: dict[tuple[str, str], dict[str, Any]] = {
+    (
+        "zai",
+        "glm-5.2",
+    ): {
+        "provider": {
+            "api": "openai-completions",
+            "baseUrl": "https://api.z.ai/api/coding/paas/v4",
+            "name": "ZAI",
+        },
+        "model": {
+            "id": "glm-5.2",
+            "name": "GLM-5.2",
+            "reasoning": True,
+            "input": ["text"],
+            "contextWindow": 1_000_000,
+            "maxTokens": 131_072,
+            "compat": {
+                "supportsDeveloperRole": False,
+                "thinkingFormat": "zai",
+            },
+        },
+    },
+}
+
+
+def _upsert_known_model_metadata(provider: str, provider_config: dict[str, Any], model_id: str) -> None:
+    metadata = _KNOWN_PROVIDER_MODEL_METADATA.get((provider, model_id))
+    if metadata is None:
+        return
+
+    provider_defaults = metadata.get("provider", {})
+    for key, value in provider_defaults.items():
+        provider_config.setdefault(key, value)
+
+    models = provider_config.setdefault("models", [])
+    if not isinstance(models, list):
+        models = []
+        provider_config["models"] = models
+
+    model_defaults = metadata["model"]
+    for index, existing in enumerate(models):
+        if isinstance(existing, dict) and existing.get("id") == model_id:
+            merged = {**model_defaults, **existing}
+            merged["compat"] = {
+                **model_defaults.get("compat", {}),
+                **(existing.get("compat") if isinstance(existing.get("compat"), dict) else {}),
+            }
+            models[index] = merged
+            return
+
+    models.append(dict(model_defaults))
 
 
 def _thinking_level_for_tier(provider: str, strength: str, model: Any) -> str | None:
@@ -2859,8 +3052,12 @@ async def _apply_profile_model(
         return
     try:
         await session.set_model(model)
-    except Exception:
-        pass
+    except Exception as exc:
+        append_history(
+            f"{red('Could not activate model:')} {selected_model_id} ({normalized_provider}) — {exc}"
+        )
+        update_footer()
+        return
     updates = {"defaultProvider": normalized_provider, "defaultModel": selected_model_id}
     if thinking_level is not None:
         effective_thinking = thinking_level
@@ -3013,6 +3210,9 @@ async def _subscription_login(provider: str, session: "AgentSession", append_his
         "access_token": credentials.access,
         "refresh_token": credentials.refresh,
         "expires_at": credentials.expires / 1000 if credentials.expires else 0,
+        "access": credentials.access,
+        "refresh": credentials.refresh,
+        "expires": credentials.expires,
         "oauth_provider": getattr(oauth_provider, "id", provider),
         **dict(credentials.extra),
     }

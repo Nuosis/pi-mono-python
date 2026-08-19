@@ -191,11 +191,10 @@ class AgentSession:
         self._scoped_models: list[dict[str, Model | ThinkingLevel | None]] | None = None
         self._bind_extension_context({})
 
-        # ── Project-local memory (P5) — flag-gated, default off ───────────────
-        # When settings.json memory_enabled=true or PI_MEMORY_ENABLED=1, attach
-        # the project-local store so the recall hook in _transform_context fires.
-        # Live auto-curation + compaction replacement are validated end-to-end by
-        # P6; default-off keeps existing behaviour unchanged.
+        # ── Project-local memory (P5) — native, with explicit kill switch ─────
+        # Memory is enabled by default; settings.json memory_enabled=false or
+        # PI_MEMORY_DISABLED=1 disables it. PI_MEMORY_ENABLED=1 force-enables it.
+        # When enabled, the recall hook in _transform_context fires.
         self._memory = None
         self._memory_store = None
         self._memory_scope = None
@@ -203,11 +202,27 @@ class AgentSession:
             from .cli_debug_log import log_event
             from .memory.integration import MemoryIntegration, memory_enabled
 
-            # settings.json `memory_enabled` is the normal control plane; env
-            # vars force on for tests/CI and one-off diagnostics.
-            settings_enabled = bool(getattr(self._settings, "memory_enabled", False))
-            env_enabled = memory_enabled()
-            enabled = settings_enabled or env_enabled
+            # settings.json `memory_enabled` is the normal control plane; the
+            # env-var surface (kill switches + force-on) is owned by
+            # `memory_enabled()` — single source of truth for the force-on
+            # branches. When settings.json is silent on memory_enabled, the
+            # runtime defaults to ON.
+            settings_flag = getattr(self._settings, "memory_enabled", None)
+            env_disabled = (
+                os.environ.get("PI_MEMORY_DISABLED", "") == "1"
+                or os.environ.get("PI_CODING_AGENT_MEMORY_DISABLED", "") == "1"
+            )
+            env_forced_on = memory_enabled()
+            if env_disabled:
+                enabled = False
+            elif env_forced_on:
+                enabled = True
+            elif settings_flag is None:
+                enabled = True  # default-on when settings.json is silent
+            else:
+                enabled = bool(settings_flag)
+            settings_enabled = enabled  # for the log_event field names below
+            env_enabled = enabled       # (same effective value, kept for back-compat with log readers)
             memory_root = os.path.abspath(os.path.expanduser(self.cwd))
             log_event(
                 "memory.attach_decision",
@@ -225,6 +240,20 @@ class AgentSession:
                     memory_root, allm_fn=self._memory_acomplete, model=model_name)
                 self._memory_store = self._memory.store
                 self._memory_scope = self._memory.scope
+                # Lane split (§LANES): auto-register the agent-triggered retrieval
+                # tools (memory.summarize_expand, memory.tool_log_lookup) on the
+                # extension runner. Native registration — no extension file or
+                # settings.json entry required. Idempotent.
+                try:
+                    from .memory.tools import register_memory_tools
+                    register_memory_tools(self._extension_runner, self._memory_store)
+                except Exception as exc:
+                    try:
+                        from .cli_debug_log import log_exception
+                        log_exception("memory.tools_registration_failed", exc,
+                                      session_id=self.session_id)
+                    except Exception:
+                        pass
                 log_event(
                     "memory.attached",
                     session_id=self.session_id,
@@ -248,6 +277,7 @@ class AgentSession:
                 pass
             self._memory = None  # never let memory wiring break session construction
         self._memory_cursor = 0  # index of last message curated into memory
+        self._memory_conv_cursor = 0  # index of last message appended to conversation_memory
 
     def _initial_goal_from_settings(self) -> str | None:
         session_vars = self._settings.session_vars or {}
@@ -475,7 +505,6 @@ class AgentSession:
         if self._extension_runner.has_handlers("context"):
             messages = await self._extension_runner.emit_context(messages)
         # P1: memory recall — inject a tail recall block when a store is attached.
-        # Off by default (store is None) so existing behaviour is unchanged.
         store = getattr(self, "_memory_store", None)
         if store is not None:
             from .memory.recall import build_recall_block, latest_user_query
@@ -556,11 +585,37 @@ class AgentSession:
         context: dict[str, Any],
         signal: asyncio.Event | None = None,
     ) -> dict[str, Any] | None:
-        if not self._extension_runner.has_handlers("tool_result"):
-            return None
+        # Lane split (§LANES): pin tool_name + tool_call_id on the active-compression
+        # chokepoint so the CCR row this tool result produces carries the same id as
+        # the durable record we'll write to tool_log_memory below. Read by the
+        # chokepoint via get_current_compression_tool_*(). The contextvar lives
+        # for the duration of the next outbound model call (and its child tasks).
+        # This MUST run before _record_tool_log so memory and CCR see the same id.
         tool_call = context.get("toolCall") or context.get("tool_call")
         tool_name = getattr(tool_call, "name", "")
         tool_call_id = getattr(tool_call, "id", "")
+        try:
+            from pi_ai import set_current_compression_tool_context
+            set_current_compression_tool_context(
+                tool_name=tool_name or None,
+                tool_call_id=tool_call_id or None,
+            )
+        except Exception:
+            pass
+        # Programmatic write: durable tool_log_memory row. Runs UNCONDITIONALLY
+        # (extension handlers are optional); the cross-link with CCR is the
+        # tool_call_id set just above.
+        try:
+            await self._record_tool_log(context)
+        except Exception as exc:
+            try:
+                from .cli_debug_log import log_exception
+                log_exception("memory.tool_log_write_failed", exc,
+                              session_id=self.session_id)
+            except Exception:
+                pass
+        if not self._extension_runner.has_handlers("tool_result"):
+            return None
         args = context.get("args") or {}
         result = context.get("result")
         is_error = bool(context.get("isError", context.get("is_error", False)))
@@ -639,6 +694,8 @@ class AgentSession:
                 return
         # Memory write path: curate this turn's new messages into the store (P5).
         await self._curate_turn()
+        # Conversation log (programmatic) — also harness-driven, runs every turn.
+        await self._record_conversation_turns()
         await self._check_compaction(msg)
 
     # ── Memory: live write path (curation) ───────────────────────────────────
@@ -746,6 +803,124 @@ class AgentSession:
             except Exception:
                 pass
             pass  # curation must never break the turn
+
+    # ── Memory: tool-log + conversation write paths ──────────────────────────
+    #
+    # Lane split (§LANES, see core/memory/LANES.md):
+    #   * tool_log_memory   — durable, project-local, cross-session record of
+    #                         every tool call. Cross-linked with CCR via
+    #                         shared tool_call_id (set in _after_tool_call).
+    #   * conversation_memory — exact conversation log; the agent can
+    #                         expand any compacted slice via
+    #                         memory.summarize_expand.
+    # Both writes are HARNESS-driven (always run), not agent-triggered.
+
+    async def _record_tool_log(self, context: dict[str, Any]) -> None:
+        """Programmatic write: append this tool call's input + output to tool_log_memory.
+
+        Called from ``_after_tool_call`` after every tool execution. Full
+        outputs go here so ``memory.tool_log_lookup(tool_call_id)`` can
+        recover them later without the agent re-issuing the call.
+        Skips silently if memory is disabled.
+        """
+        if self._memory_store is None:
+            return
+        tool_call = context.get("toolCall") or context.get("tool_call")
+        tool_name = getattr(tool_call, "name", "") or ""
+        tool_call_id = getattr(tool_call, "id", "") or ""
+        if not tool_name or not tool_call_id:
+            return
+        args = context.get("args") or {}
+        result = context.get("result")
+        output_text = ""
+        try:
+            content = (result.get("content", []) if isinstance(result, dict)
+                       else getattr(result, "content", []) or [])
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text" and block.get("text"):
+                        parts.append(str(block["text"]))
+                else:
+                    text = getattr(block, "text", None)
+                    if text:
+                        parts.append(str(text))
+            output_text = "\n".join(parts) if parts else ""
+            details = (result.get("details") if isinstance(result, dict)
+                       else getattr(result, "details", None))
+            if details is not None and not output_text:
+                try:
+                    output_text = json.dumps(_safe_json(details), ensure_ascii=False)[:8000]
+                except Exception:
+                    output_text = str(details)[:8000]
+        except Exception:
+            output_text = ""
+        try:
+            self._memory_store.record_tool_log(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                tool_args=args if isinstance(args, (dict, str)) else str(args),
+                output=output_text[:32_000],  # cap to keep the row bounded
+            )
+        except Exception as exc:
+            try:
+                from .cli_debug_log import log_exception
+                log_exception("memory.tool_log_write_failed", exc,
+                              session_id=self.session_id,
+                              tool_call_id=tool_call_id, tool_name=tool_name)
+            except Exception:
+                pass
+
+    async def _record_conversation_turns(self) -> None:
+        """Append every new user_turn / assistant_output to conversation_memory.
+
+        Thread-id is the agent session_id so each session gets its own
+        conversational history. This is the HARNESS-side write — the
+        agent never invokes this method; the runtime calls it after
+        every turn completes (mirrors Oracle's programmatic write path).
+        """
+        if self._memory_store is None:
+            return
+        try:
+            from .memory.models import ConversationTurn
+        except Exception:
+            return
+        msgs = self._agent.state.messages
+        start = self._memory_conv_cursor
+        self._memory_conv_cursor = len(msgs)
+        thread_id = self.session_id or ""
+        written = 0
+        for i, m in enumerate(msgs[start:], start=start):
+            role = getattr(m, "role", "")
+            if role not in ("user", "assistant"):
+                continue
+            text = _message_text(m)
+            if not text:
+                continue
+            try:
+                self._memory_store.append_turn(ConversationTurn(
+                    id="", project="", role=role, content=text,
+                    scope_id=thread_id,
+                ))
+                written += 1
+            except Exception as exc:
+                try:
+                    from .cli_debug_log import log_exception
+                    log_exception("memory.conversation_write_failed", exc,
+                                  session_id=self.session_id, msg_index=i)
+                except Exception:
+                    pass
+        if written:
+            try:
+                from .cli_debug_log import log_event
+                log_event(
+                    "memory.conversation_written",
+                    session_id=self.session_id,
+                    thread_id=thread_id,
+                    written=written,
+                )
+            except Exception:
+                pass
 
     def _emit(self, event: dict | Any) -> None:
         """Emit a synthetic session event to all listeners."""
@@ -1100,6 +1275,275 @@ class AgentSession:
         forked_sm = self._session_manager.branch(branch_point, self.cwd)
         await self._switch_to_session_manager(forked_sm)
         return {"cancelled": False, "selectedText": selected_text}
+
+    async def recover_session(self, target: str | int | None = None) -> dict[str, Any]:
+        """
+        Recover from a failed tail by branching before it and injecting a checkpoint.
+
+        `target` can be:
+        - None, "last", or "1": most recent failure
+        - "2", "3", ...: nth most recent failure
+        - an entry id: recover from that exact entry
+        """
+        entries = self._session_manager.get_entries()
+        if not entries:
+            return {"cancelled": True, "reason": "empty_session"}
+
+        source = self._select_recovery_source(entries, target)
+        if source is None:
+            return {"cancelled": True, "reason": "no_failure_found"}
+
+        branch_point_id = self._recovery_branch_point(entries, source)
+        source_index = next((i for i, entry in enumerate(entries) if entry.id == source.id), -1)
+        branch_index = (
+            next((i for i, entry in enumerate(entries) if entry.id == branch_point_id), -1)
+            if branch_point_id
+            else -1
+        )
+        dropped = [
+            entry.id
+            for entry in entries[branch_index + 1:source_index + 1]
+            if entry.id
+        ]
+        preserved = [entry.id for entry in entries[:branch_index + 1] if entry.id]
+        reason = self._classify_recovery_reason(source)
+        summary = self._build_recovery_summary(entries, source, reason, branch_point_id, dropped)
+
+        recovered_sm = self._session_manager.branch(branch_point_id, self.cwd)
+        recovery_entry_id = recovered_sm.append_recovery(
+            summary,
+            reason=reason,
+            source_entry_id=source.id,
+            branch_point_id=branch_point_id,
+            dropped_entry_ids=dropped,
+            preserved_entry_ids=preserved[-12:],
+            details={
+                "target": str(target or "last"),
+                "sourceType": source.type,
+                "sourceTimestamp": source.timestamp,
+            },
+        )
+        old_session_id = self.session_id
+        await self._switch_to_session_manager(recovered_sm)
+        return {
+            "cancelled": False,
+            "reason": reason,
+            "sourceEntryId": source.id,
+            "branchPointId": branch_point_id,
+            "recoveryEntryId": recovery_entry_id,
+            "droppedEntryIds": dropped,
+            "oldSessionId": old_session_id,
+            "newSessionId": self.session_id,
+            "summary": summary,
+        }
+
+    def _select_recovery_source(
+        self,
+        entries: list[SessionEntry],
+        target: str | int | None,
+    ) -> SessionEntry | None:
+        if isinstance(target, str):
+            raw = target.strip()
+            if raw and raw not in {"last", "latest"} and not raw.isdigit():
+                return self._session_manager.get_entry(raw)
+            target = raw or None
+
+        failures = [entry for entry in entries if self._is_recovery_failure(entry)]
+        if not failures:
+            return None
+        index = 1
+        if isinstance(target, int):
+            index = target
+        elif isinstance(target, str) and target.isdigit():
+            index = int(target)
+        index = max(1, index)
+        if index > len(failures):
+            return None
+        return list(reversed(failures))[index - 1]
+
+    def _is_recovery_failure(self, entry: SessionEntry) -> bool:
+        text = self._entry_text(entry).lower()
+        msg = entry.data.get("message", {})
+        if isinstance(msg, dict):
+            if msg.get("stop_reason") == "error" or msg.get("stopReason") == "error":
+                return True
+            if msg.get("error_message") or msg.get("errorMessage"):
+                return True
+            if msg.get("is_error") or msg.get("isError"):
+                return True
+            details = msg.get("details")
+            if isinstance(details, dict) and details.get("kind") == "tool_error":
+                return True
+        return any(
+            needle in text
+            for needle in (
+                "context_length_exceeded",
+                "context window",
+                "traceback",
+                "timeouterror",
+                "timed out",
+                "command exited with code 1",
+                "error code:",
+            )
+        )
+
+    def _recovery_branch_point(
+        self,
+        entries: list[SessionEntry],
+        source: SessionEntry,
+    ) -> str | None:
+        by_id = {entry.id: entry for entry in entries}
+        parent = by_id.get(source.parent_id) if source.parent_id else None
+        if parent and self._entry_is_tool_result(parent):
+            grandparent = by_id.get(parent.parent_id) if parent.parent_id else None
+            if grandparent and self._entry_has_tool_call(grandparent):
+                return grandparent.parent_id
+            return parent.parent_id
+        if self._entry_is_tool_result(source):
+            parent = by_id.get(source.parent_id) if source.parent_id else None
+            if parent and self._entry_has_tool_call(parent):
+                return parent.parent_id
+            return source.parent_id
+        return source.parent_id
+
+    def _classify_recovery_reason(self, entry: SessionEntry) -> str:
+        text = self._entry_text(entry).lower()
+        if "context_length_exceeded" in text or "context window" in text:
+            return "context_length_exceeded"
+        if "timed out" in text or "timeouterror" in text:
+            return "timeout"
+        if "traceback" in text:
+            return "exception"
+        msg = entry.data.get("message", {})
+        if isinstance(msg, dict):
+            details = msg.get("details")
+            if isinstance(details, dict) and details.get("kind") == "tool_error":
+                return "tool_error"
+            if msg.get("stop_reason") == "error" or msg.get("stopReason") == "error":
+                return "model_error"
+        return "failure"
+
+    def _build_recovery_summary(
+        self,
+        entries: list[SessionEntry],
+        source: SessionEntry,
+        reason: str,
+        branch_point_id: str | None,
+        dropped_entry_ids: list[str],
+    ) -> str:
+        recent_user = [
+            self._entry_text(entry)
+            for entry in entries
+            if entry.type == "message"
+            and isinstance(entry.data.get("message"), dict)
+            and entry.data["message"].get("role") == "user"
+            and self._entry_text(entry).strip()
+        ][-4:]
+        branch_index = (
+            next((i for i, entry in enumerate(entries) if entry.id == branch_point_id), -1)
+            if branch_point_id
+            else -1
+        )
+        preserved_entries = entries[:branch_index + 1] if branch_index >= 0 else []
+        useful_tool_outputs = [
+            self._summarize_tool_result(entry)
+            for entry in preserved_entries
+            if self._entry_is_tool_result(entry) and not self._is_recovery_failure(entry)
+        ]
+        useful_tool_outputs = [text for text in useful_tool_outputs if text][-4:]
+        failure_excerpt = self._clip_text(self._entry_text(source), 1200)
+
+        lines = [
+            "## Recovery Point",
+            f"Recovered from `{reason}` at entry `{source.id}`.",
+            "",
+            "## Failure",
+            failure_excerpt or "(no failure text captured)",
+            "",
+            "## Preserved Context",
+        ]
+        if recent_user:
+            lines.append("Recent user requests:")
+            lines.extend(f"- {self._clip_text(item, 240)}" for item in recent_user)
+        else:
+            lines.append("- No recent user request text found.")
+        if useful_tool_outputs:
+            lines.append("")
+            lines.append("Recent successful tool evidence:")
+            lines.extend(f"- {item}" for item in useful_tool_outputs)
+        lines.extend([
+            "",
+            "## Dropped Tail",
+            f"- Branch point: `{branch_point_id or 'session-root'}`",
+            f"- Dropped entries: {', '.join(dropped_entry_ids) if dropped_entry_ids else '(none)'}",
+            "",
+            "## Next Step",
+            "Continue from the preserved branch. Treat the failure above as diagnostic evidence, "
+            "but do not re-load the dropped raw tool output unless it is specifically needed.",
+        ])
+        return "\n".join(lines)
+
+    def _entry_text(self, entry: SessionEntry) -> str:
+        msg = entry.data.get("message", {})
+        if isinstance(msg, dict):
+            parts: list[str] = []
+            err = msg.get("error_message") or msg.get("errorMessage")
+            if err:
+                parts.append(str(err))
+            content = msg.get("content", [])
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        if isinstance(block.get("text"), str):
+                            parts.append(block["text"])
+                        elif isinstance(block.get("thinking"), str):
+                            parts.append(block["thinking"])
+                        elif block.get("type") in {"toolCall", "tool_call"}:
+                            parts.append(str(block.get("name") or "tool_call"))
+                            arguments = block.get("arguments") or block.get("input")
+                            if arguments is not None:
+                                try:
+                                    parts.append(json.dumps(arguments, ensure_ascii=False))
+                                except TypeError:
+                                    parts.append(str(arguments))
+            return "\n".join(parts)
+        if entry.type in {"branch_summary", "recovery", "compaction"}:
+            summary = entry.data.get("summary")
+            return str(summary or "")
+        if entry.type == "custom_message":
+            return str(entry.data.get("content") or "")
+        return ""
+
+    def _entry_is_tool_result(self, entry: SessionEntry) -> bool:
+        msg = entry.data.get("message", {})
+        return isinstance(msg, dict) and msg.get("role") == "toolResult"
+
+    def _entry_has_tool_call(self, entry: SessionEntry) -> bool:
+        msg = entry.data.get("message", {})
+        if not isinstance(msg, dict):
+            return False
+        content = msg.get("content", [])
+        return isinstance(content, list) and any(
+            isinstance(block, dict) and block.get("type") in {"toolCall", "tool_call"}
+            for block in content
+        )
+
+    def _summarize_tool_result(self, entry: SessionEntry) -> str:
+        text = self._entry_text(entry)
+        if not text.strip():
+            return ""
+        first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        if not first_line:
+            return ""
+        return self._clip_text(first_line, 220)
+
+    def _clip_text(self, text: str, limit: int) -> str:
+        cleaned = " ".join(str(text).split())
+        if len(cleaned) <= limit:
+            return cleaned
+        return cleaned[: max(0, limit - 3)] + "..."
 
     def get_session_tree_entries(self) -> list[dict[str, Any]]:
         """Return a flat session-tree listing for RPC/TUI fallback commands."""
@@ -2523,6 +2967,7 @@ class AgentSession:
     newSession = new_session
     cloneSession = clone_session
     forkSession = fork_session
+    recoverSession = recover_session
     getSessionTreeEntries = get_session_tree_entries
     navigateTree = navigate_tree
     getSteeringMessages = get_steering_messages
@@ -2607,3 +3052,28 @@ def _message_text(msg: Any) -> str:
         else:
             parts.append(getattr(b, "text", "") or getattr(b, "thinking", "") or "")
     return "\n".join(p for p in parts if p)
+
+
+def _safe_json(obj: Any) -> Any:
+    """Best-effort JSON-safe coercion for tool_log writes.
+
+    Pydantic models → model_dump(mode='json'); dataclasses → __dict__;
+    other objects → str. Tuples → lists. Never raises — returns a
+    fallback string if all else fails, so the log row never blocks
+    tool execution.
+    """
+    try:
+        if hasattr(obj, "model_dump"):
+            return obj.model_dump(mode="json")
+        if isinstance(obj, dict):
+            return {k: _safe_json(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_safe_json(v) for v in obj]
+        if isinstance(obj, (str, int, float, bool)) or obj is None:
+            return obj
+        return str(obj)
+    except Exception:
+        try:
+            return str(obj)
+        except Exception:
+            return "<unserializable>"

@@ -1,5 +1,11 @@
-"""Active compression — content-aware, reversible (CCR) compression of tool-output
-payloads, installed as pi_ai's universal outbound compressor.
+"""Legacy local active compression for Tau.
+
+This package is Tau's hand-rolled CCR/compression implementation. It is not the
+Headroom SDK path. Keep changes here isolated while real Headroom integration is
+designed and tested.
+
+It currently provides content-aware, reversible compression of tool-output
+payloads and installs itself as pi_ai's universal outbound compressor.
 
 Flag: `active_compression` in settings.json — **default ON if absent**. Env
 kill-switch `PI_ACTIVE_COMPRESSION_DISABLED=1`. Registered on import (the per-call
@@ -15,8 +21,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 from .ccr import CCRStore
+from .compressor import CompressionConfig
 from .compressor import compress as _compress_text
 
 SETTING = "active_compression"
@@ -31,6 +39,7 @@ __all__ = [
     "builtin_extension_path",
     "SETTING",
     "DISABLE_ENV",
+    "CompressionConfig",
 ]
 
 
@@ -75,10 +84,100 @@ def _ccr() -> CCRStore:
     return _store
 
 
+class _CCRWithContext:
+    """Lane-cross-link proxy: threads tool_name + tool_call_id into CCR put().
+
+    When the active-compression chokepoint is hit for a toolResult whose
+    tool_call_id is known, we wrap the underlying CCR store in this proxy. Every
+    ``put`` / ``put_with_handle`` call (made deep inside compressor.py) gets the
+    tool context injected as metadata. The durable record is still in CCR; the
+    cross-link lets memory.tool_log_lookup(tool_call_id) be reachable from a
+    ``[CCR:handle]`` marker, and vice versa. See core/memory/LANES.md.
+
+    Read paths (``get`` / ``search`` / ``retrieve``) pass through untouched —
+    this is a write-side concern only.
+    """
+
+    __slots__ = ("_store", "_tool_name", "_tool_call_id")
+
+    def __init__(self, store: CCRStore, tool_name: str | None, tool_call_id: str | None) -> None:
+        self._store = store
+        self._tool_name = tool_name
+        self._tool_call_id = tool_call_id
+
+    def put(self, content: str, **kwargs: Any) -> str:
+        kwargs.setdefault("tool_name", self._tool_name)
+        kwargs.setdefault("tool_call_id", self._tool_call_id)
+        return self._store.put(content, **kwargs)
+
+    def put_with_handle(self, handle: str, content: str, **kwargs: Any) -> str:
+        kwargs.setdefault("tool_name", self._tool_name)
+        kwargs.setdefault("tool_call_id", self._tool_call_id)
+        return self._store.put_with_handle(handle, content, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
+
+
+def _contextualized_store() -> CCRStore:
+    """Return the CCR store, wrapped with the current tool context if any.
+
+    The chokepoint reads ``get_current_compression_tool_*`` (set by
+    agent_session before the toolResult is sent). When either is set, the
+    returned store injects those values into every put() / put_with_handle()
+    call, which is the only write path the active-compression chokepoint uses.
+    """
+    store = _ccr()
+    try:
+        from pi_ai import get_current_compression_tool_call_id, get_current_compression_tool_name
+        tool_name = get_current_compression_tool_name()
+        tool_call_id = get_current_compression_tool_call_id()
+    except Exception:
+        return store
+    if tool_name is None and tool_call_id is None:
+        return store
+    return _CCRWithContext(store, tool_name, tool_call_id)
+
+
 def compress(text: str) -> str:
     if not is_enabled():
         return text
-    return _compress_text(text, _ccr())
+    force = False
+    target_ratio = None
+    config = CompressionConfig()
+    try:
+        from pi_ai import (
+            get_current_compression_enable_ccr_marker,
+            get_current_compression_force_compression,
+            get_current_compression_lossless_min_savings_ratio,
+            get_current_compression_max_items_after_crush,
+            get_current_compression_min_tokens,
+            get_current_compression_target_ratio,
+        )
+
+        force = get_current_compression_force_compression()
+        target_ratio = get_current_compression_target_ratio()
+        min_tokens = get_current_compression_min_tokens()
+        max_items_after_crush = get_current_compression_max_items_after_crush()
+        lossless_min_savings_ratio = get_current_compression_lossless_min_savings_ratio()
+        enable_ccr_marker = get_current_compression_enable_ccr_marker()
+        config = CompressionConfig(
+            min_tokens=config.min_tokens if min_tokens is None else min_tokens,
+            max_items_after_crush=(
+                config.max_items_after_crush if max_items_after_crush is None else max_items_after_crush
+            ),
+            lossless_min_savings_ratio=(
+                config.lossless_min_savings_ratio
+                if lossless_min_savings_ratio is None
+                else lossless_min_savings_ratio
+            ),
+            enable_ccr_marker=config.enable_ccr_marker if enable_ccr_marker is None else enable_ccr_marker,
+        )
+    except Exception:
+        force = False
+        target_ratio = None
+        config = CompressionConfig()
+    return _compress_text(text, _contextualized_store(), target_ratio=target_ratio, force=force, config=config)
 
 
 def retrieve(handle: str) -> str | None:

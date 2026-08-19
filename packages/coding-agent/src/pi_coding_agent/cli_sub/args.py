@@ -14,7 +14,9 @@ from pi_coding_agent.config import APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, ENV
 
 Mode = Literal["text", "json", "rpc"]
 
-VALID_THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh")
+VALID_THINKING_LEVELS = (
+    "off", "minimal", "low", "medium", "high", "xhigh", "adaptive",
+)
 
 
 def is_valid_thinking_level(level: str) -> bool:
@@ -74,6 +76,12 @@ class Args:
     inherit: bool = False
     # Scaffold the project-local .tau structure here, then launch.
     init: bool = False
+    # One-shot ops: --setup-ollama (ensure local embedding service is up +
+    # pre-pulled model), --doctor (smoke check the runtime: settings, ollama,
+    # memory db, ccr cache). Each runs in foreground, prints results, exits.
+    setup_ollama: bool = False
+    doctor: bool = False
+    pull_model: str | None = None  # --pull-model <name> for setup-ollama flow
 
 
 VALID_TOOL_NAMES = {"read", "bash", "edit", "write", "grep", "find", "ls"}
@@ -104,6 +112,14 @@ def parse_args(
     """Parse CLI arguments into an Args dataclass."""
     result = Args()
     i = 0
+    if args and args[0] == "resume":
+        next_arg = args[1] if len(args) > 1 else None
+        if next_arg is not None and not next_arg.startswith("-") and not next_arg.startswith("@"):
+            result.session = next_arg
+            i = 2
+        else:
+            result.resume = True
+            i = 1
     while i < len(args):
         arg = args[i]
 
@@ -275,6 +291,13 @@ def parse_args(
             result.inherit = True
         elif arg == "--init":
             result.init = True
+        elif arg == "--setup-ollama":
+            result.setup_ollama = True
+        elif arg == "--doctor":
+            result.doctor = True
+        elif arg == "--pull-model":
+            i += 1
+            result.pull_model = (args[i] if i < len(args) else "") or None
         elif arg.startswith("@"):
             result.file_args.append(arg[1:])
         elif arg.startswith("--"):
@@ -335,7 +358,7 @@ Commands:
   {APP_NAME} install <source> [-l]     Install extension source and add to settings
   {APP_NAME} remove <source> [-l]      Remove extension source from settings
   {APP_NAME} uninstall <source> [-l]   Alias for remove
-  {APP_NAME} update [self|pi|all]      Update tau; use all to include extensions
+  {APP_NAME} update [self|pi|tau|all]  Update tau; use all to include extensions
   tau update                         Update tau from PyPI
   {APP_NAME} list [--approve|--no-approve]
                                   List installed extensions from settings
@@ -386,6 +409,12 @@ Options:
                                    settings, and ~/.tau/extensions (default: project-local only)
   --init                         Scaffold a .tau project (settings, skills/, prompts/,
                                    extensions/, AGENTS.md) in the current dir, then launch
+  --setup-ollama                 Install + start the local Ollama service and pre-pull
+                                   the default embed model. Required for memory recall.
+  --pull-model <name>             With --setup-ollama, pull a different model instead
+                                   of the default (nomic-embed-text).
+  --doctor                       Run a smoke check: settings, ollama, memory db, ccr
+                                   cache. Exits 0 on green, 1 on red, prints a report.
   --help, -h                     Show this help
   --version, -v                  Show version number
   --kill [session]               Kill a running tau session by id/pid, or all sessions if omitted
