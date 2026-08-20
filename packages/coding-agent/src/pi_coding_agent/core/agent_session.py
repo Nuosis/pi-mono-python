@@ -624,9 +624,6 @@ class AgentSession:
             except ValueError:
                 timeout_seconds = 15.0
             await _instr_flush(timeout_seconds=timeout_seconds)
-        if self._extension_runner.has_handlers("turn_end"):
-            await self._extension_runner.emit({"type": "turn_end", **turn_context})
-
         message = turn_context.get("message")
         tool_results = turn_context.get("tool_results") or turn_context.get("toolResults") or []
 
@@ -641,6 +638,9 @@ class AgentSession:
             except Exception:  # noqa: BLE001
                 pass
             return None
+
+        if self._extension_runner.has_handlers("turn_end"):
+            await self._extension_runner.emit({"type": "turn_end", **turn_context})
 
         # Tool turns and extension-queued continuations are working state, not
         # output. A TurnEnd hook must not steer either one.
