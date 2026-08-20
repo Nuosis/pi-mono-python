@@ -285,6 +285,23 @@ async def test_turn_end_hook_finalizes_only_the_finished_answer(agent_session, t
     )
 
     calls: list[dict[str, object]] = []
+    extension_turns: list[str] = []
+
+    async def observe_candidate(event, ctx):
+        del ctx
+        extension_turns.extend(
+            block.text
+            for block in event["message"].content
+            if isinstance(block, TextContent)
+        )
+
+    agent_session.extension_runner.extensions.append(
+        Extension(
+            path="candidate-observer",
+            resolved_path="candidate-observer",
+            handlers={"turn_end": [observe_candidate]},
+        )
+    )
 
     async def two_response_stream(model, context, opts=None):
         calls.append(
@@ -320,6 +337,7 @@ async def test_turn_end_hook_finalizes_only_the_finished_answer(agent_session, t
     assert calls[0]["tools"]
     assert calls[1]["tools"] == []
     assert calls[1]["last_role"] == "user"
+    assert extension_turns == ["**Project**: `task-deadbeef`. Which option do you want?"]
 
     turn_payload = json.loads(turn_end_input.read_text(encoding="utf-8"))
     assert turn_payload["last_assistant_message"].startswith("**Project**")
