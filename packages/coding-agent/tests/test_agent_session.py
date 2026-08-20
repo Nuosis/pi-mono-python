@@ -4,9 +4,12 @@ Tests for AgentSession — mirrors packages/coding-agent/test/ agent session tes
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import sys
 import tempfile
 import time
+from pathlib import Path
 from typing import AsyncGenerator
 
 import pytest
@@ -208,6 +211,124 @@ async def test_turn_end_extension_can_continue_same_agent_loop(agent_session):
         if isinstance(block, TextContent)
     ]
     assert assistant_texts == ["premature", "completed after guard"]
+
+
+@pytest.mark.asyncio
+async def test_turn_end_hook_finalizes_only_the_finished_answer(agent_session, tmp_path):
+    """A TurnEnd hook owns the user-facing answer, after ordinary work ends.
+
+    This is a lifecycle contract, not evidence that a model follows the voice
+    profile. The behavioral claim is covered by a live-model replay.
+    """
+    hook_dir = Path(agent_session.cwd) / ".tau"
+    hook_dir.mkdir()
+    turn_end_input = tmp_path / "turn-end-input.json"
+    stop_input = tmp_path / "stop-input.json"
+    finalizer = tmp_path / "finalizer.py"
+    finalizer.write_text(
+        "\n".join(
+            [
+                "import json, pathlib, sys",
+                "payload = json.load(sys.stdin)",
+                f"pathlib.Path({str(turn_end_input)!r}).write_text(json.dumps(payload))",
+                "print(json.dumps({'hookSpecificOutput': {",
+                "    'hookEventName': 'TurnEnd',",
+                "    'additionalContext': 'FINAL VOICE RULES',",
+                "    'replacementPrompt': 'Rewrite the draft for delivery.',",
+                "}}))",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    auditor = tmp_path / "audit.py"
+    auditor.write_text(
+        "\n".join(
+            [
+                "import json, pathlib, sys",
+                "payload = json.load(sys.stdin)",
+                f"pathlib.Path({str(stop_input)!r}).write_text(json.dumps(payload))",
+                "print(json.dumps({'suppressOutput': True}))",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (hook_dir / "hooks.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "TurnEnd": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": f"{sys.executable} {finalizer}",
+                                    "timeout": 5,
+                                }
+                            ]
+                        }
+                    ],
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": f"{sys.executable} {auditor}",
+                                    "timeout": 5,
+                                }
+                            ]
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    calls: list[dict[str, object]] = []
+
+    async def two_response_stream(model, context, opts=None):
+        calls.append(
+            {
+                "system": context.system_prompt,
+                "tools": [tool.name for tool in context.tools],
+                "last_role": context.messages[-1].role,
+                "last_text": str(context.messages[-1].content),
+            }
+        )
+        text = (
+            "**Project**: `task-deadbeef`. Which option do you want?"
+            if len(calls) == 1
+            else "The project record is stale. I checked the code and found the gap."
+        )
+        partial = AssistantMessage(
+            role="assistant", content=[], api=model.api, provider=model.provider,
+            model=model.id, usage=Usage(), stop_reason="stop", timestamp=_ts(),
+        )
+        yield EventStart(type="start", partial=partial)
+        final = partial.model_copy(
+            update={"content": [TextContent(type="text", text=text)]}
+        )
+        yield EventDone(type="done", reason="stop", message=final)
+
+    agent_session._agent.stream_fn = two_response_stream
+    await agent_session.prompt("Check the code, then tell me what changed.")
+
+    assert len(calls) == 2
+    assert "FINAL VOICE RULES" not in str(calls[0]["system"])
+    assert "**Project**: `task-deadbeef`" in str(calls[1]["last_text"]), calls
+    assert "FINAL VOICE RULES" in str(calls[1]["system"])
+    assert calls[0]["tools"]
+    assert calls[1]["tools"] == []
+    assert calls[1]["last_role"] == "user"
+
+    turn_payload = json.loads(turn_end_input.read_text(encoding="utf-8"))
+    assert turn_payload["last_assistant_message"].startswith("**Project**")
+    stop_payload = json.loads(stop_input.read_text(encoding="utf-8"))
+    assert stop_payload["last_assistant_message"] == (
+        "The project record is stale. I checked the code and found the gap."
+    )
+    assert agent_session._agent.state.system_prompt == agent_session._base_system_prompt
+    assert agent_session._agent.state.tools
 
 
 @pytest.mark.asyncio

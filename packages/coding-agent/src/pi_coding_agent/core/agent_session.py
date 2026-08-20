@@ -173,6 +173,9 @@ class AgentSession:
             else None
         )
         self._current_goal = self._initial_goal_from_session_vars()
+        self._turn_end_finalizing = False
+        self._turn_end_original_system_prompt: str | None = None
+        self._turn_end_original_tools: list[Any] | None = None
 
         if session_manager is not None:
             self._session_manager = session_manager
@@ -836,6 +839,13 @@ class AgentSession:
         final_payload = payload
         if self._extension_runner.has_handlers("before_provider_request"):
             final_payload = await self._extension_runner.emit_before_provider_request(payload)
+        # PreGeneration hooks mirror UserPromptSubmit. Output-only controls use
+        # TurnEnd instead, after tools are finished.
+        try:
+            from pi_agent.hooks import inject_pregeneration
+            final_payload = inject_pregeneration(final_payload, self.session_id)
+        except Exception:  # noqa: BLE001
+            pass
         # Instrumentation: the exact request handed to the provider — system
         # prompt, message history, and tools — the definitive record of what the
         # brain received on this turn.
@@ -880,10 +890,72 @@ class AgentSession:
             except ValueError:
                 timeout_seconds = 15.0
             await _instr_flush(timeout_seconds=timeout_seconds)
-        if not self._extension_runner.has_handlers("turn_end"):
+        if self._extension_runner.has_handlers("turn_end"):
+            await self._extension_runner.emit({"type": "turn_end", **turn_context})
+
+        message = turn_context.get("message")
+        tool_results = turn_context.get("tool_results") or turn_context.get("toolResults") or []
+
+        # The response after our internal finalization request is the one the
+        # caller will receive. Restore ordinary agent capabilities before the
+        # loop ends, audit this delivered response, and never finalize twice.
+        if self._turn_end_finalizing:
+            self._restore_after_turn_end_finalization()
+            try:
+                from pi_agent.hooks import report_stop
+                report_stop(message, self.session_id, self.cwd)
+            except Exception:  # noqa: BLE001
+                pass
             return None
-        await self._extension_runner.emit({"type": "turn_end", **turn_context})
+
+        # Tool turns and extension-queued continuations are working state, not
+        # output. A TurnEnd hook must not steer either one.
+        content = getattr(message, "content", []) or []
+        has_tool_calls = any(
+            getattr(block, "type", "") in {"toolCall", "tool_call", "tool_use"}
+            for block in content
+        )
+        stop_reason = getattr(message, "stop_reason", "") or getattr(message, "stopReason", "")
+        if tool_results or has_tool_calls or stop_reason in {"error", "aborted"}:
+            return None
+        if self._agent.has_queued_messages():
+            return None
+
+        try:
+            from pi_agent.hooks import gather_turn_end, report_stop
+
+            request = gather_turn_end(message, self.session_id, self.cwd)
+            if not request:
+                report_stop(message, self.session_id, self.cwd)
+                return None
+
+            self._turn_end_original_system_prompt = self._agent.state.system_prompt
+            self._turn_end_original_tools = list(self._agent.state.tools)
+            self._agent.set_system_prompt(
+                f"{self._turn_end_original_system_prompt}\n\n"
+                f"{request['additional_context']}"
+            )
+            # The finalizer rewrites an already-grounded answer. It cannot call
+            # tools or mutate the world during this output-only pass.
+            self._agent.set_tools([])
+            current_context = turn_context.get("context")
+            if current_context is not None:
+                current_context.system_prompt = self._agent.state.system_prompt
+                current_context.tools = []
+            self._turn_end_finalizing = True
+            await self.follow_up(request["replacement_prompt"])
+        except Exception:  # noqa: BLE001
+            self._restore_after_turn_end_finalization()
         return None
+
+    def _restore_after_turn_end_finalization(self) -> None:
+        if self._turn_end_original_system_prompt is not None:
+            self._agent.set_system_prompt(self._turn_end_original_system_prompt)
+        if self._turn_end_original_tools is not None:
+            self._agent.set_tools(self._turn_end_original_tools)
+        self._turn_end_original_system_prompt = None
+        self._turn_end_original_tools = None
+        self._turn_end_finalizing = False
 
     async def _before_tool_call(
         self,
@@ -1023,6 +1095,11 @@ class AgentSession:
 
         # ── agent_end: check retry and compaction ─────────────────────────────
         if event.type == "agent_end":
+            # Provider failures exit the loop before prepare_next_turn runs.
+            # Do not let a failed finalization leave tools disabled or its
+            # one-shot voice context attached to the next user turn.
+            if self._turn_end_finalizing:
+                self._restore_after_turn_end_finalization()
             if self._last_assistant_msg is not None:
                 msg = self._last_assistant_msg
                 self._last_assistant_msg = None
