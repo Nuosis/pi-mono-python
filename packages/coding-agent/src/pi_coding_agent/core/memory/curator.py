@@ -11,7 +11,9 @@ tested with a stub and eval'd with a real local/tier model.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Literal
 
@@ -25,6 +27,19 @@ AsyncLlmFn = Callable[[str, str], Awaitable[str]]  # async variant for the live 
 # deliberately excluded — the agent's own prose is not evidence for owner memory.
 ELIGIBLE_KINDS = {"user_turn", "tool_result", "proposal"}
 _VALID_TYPES = {t.value for t in MemoryType}
+_EXPLICIT_PREFERENCE_MARKERS = (
+    "preference",
+    "procedural rule",
+    "new rule",
+    "going forward",
+    "from now on",
+    "remember that",
+    "please always",
+    "when i give you a command",
+    "consider that approval",
+    "do not request approval",
+    "don't request approval",
+)
 
 Verdict = Literal["auto_commit", "needs_review", "reject"]
 
@@ -94,6 +109,7 @@ class Curator:
             if d.verdict == "auto_commit" and self.verify:
                 self._apply_verify(d, self.llm_fn(SYSTEM_VERIFY,
                                                   self._verify_prompt(d, ev_by_id)))
+        decisions.extend(self._explicit_preference_fallbacks(evidence, decisions))
         return decisions
 
     # ── async path (live session, via stream_simple) ─────────────────────────
@@ -106,6 +122,7 @@ class Curator:
             if d.verdict == "auto_commit" and self.verify:
                 self._apply_verify(d, await self.allm_fn(
                     SYSTEM_VERIFY, self._verify_prompt(d, ev_by_id)))
+        decisions.extend(self._explicit_preference_fallbacks(evidence, decisions))
         return decisions
 
     async def acurate_and_commit(self, evidence: list[Evidence]) -> list[str]:
@@ -192,3 +209,69 @@ class Curator:
             d.verdict = "reject"
             d.rationale = f"guard: {reason}; {d.rationale}"
         return d
+
+    def _explicit_preference_fallbacks(
+        self,
+        evidence: list[Evidence],
+        existing: list[CommitDecision],
+    ) -> list[CommitDecision]:
+        """Promote clear user-declared preferences even if model extraction misses.
+
+        The LLM curator remains the general writer. This deterministic path is
+        deliberately narrow: it only uses direct user turns with explicit
+        preference/rule language, cites only that user evidence id, and writes a
+        project-scoped preference. Assistant acknowledgements are not evidence.
+        """
+        already_cited = {
+            source_id
+            for decision in existing
+            if decision.memory_type == MemoryType.PREFERENCE.value
+            and decision.verdict != "reject"
+            for source_id in decision.source_ids
+        }
+        fallbacks: list[CommitDecision] = []
+        for ev in evidence:
+            if ev.kind != "user_turn" or ev.id in already_cited:
+                continue
+            text = _clean_space(ev.text)
+            if not _is_explicit_preference(text):
+                continue
+            title = _preference_title(text)
+            key = "preference:" + hashlib.sha1(text.lower().encode("utf-8")).hexdigest()[:16]
+            fallbacks.append(CommitDecision(
+                title=title,
+                content=text,
+                memory_type=MemoryType.PREFERENCE.value,
+                key=key,
+                source_ids=[ev.id],
+                verdict="auto_commit",
+                confidence=1.0,
+                rationale="deterministic explicit user preference fallback",
+            ))
+        return fallbacks
+
+
+def _clean_space(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_explicit_preference(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _EXPLICIT_PREFERENCE_MARKERS)
+
+
+def _preference_title(text: str) -> str:
+    normalized = _clean_space(text)
+    match = re.search(
+        r"\b(?:when|always|prefer|use|list|lead|show|format)\b(.{0,90})",
+        normalized,
+        re.IGNORECASE,
+    )
+    if match:
+        title = _clean_space(match.group(0))
+    else:
+        title = normalized
+    title = title.rstrip(" .:")
+    if len(title) > 96:
+        title = title[:93].rstrip() + "..."
+    return title or "user preference"

@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import subprocess
 import sys
-import urllib.request
+import tomllib
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -17,7 +16,7 @@ from .cli_sub.args import parse_args, print_help
 from .cli_sub.file_processor import process_file_arguments
 from .cli_sub.list_models import list_models
 from .cli_sub.session_picker import select_session
-from .config import APP_NAME, agent_dir_env, get_agent_dir
+from .config import APP_NAME, CONFIG_DIR_NAME, agent_dir_env, get_agent_dir
 from .core.agent_session_runtime import (
     CreateAgentSessionRuntimeResult,
     create_agent_session_runtime,
@@ -47,7 +46,8 @@ from .core.trust_manager import ProjectTrustStore, has_project_trust_inputs
 from .migrations import run_migrations, show_deprecation_warnings
 from .modes import run_interactive_mode, run_print_mode, run_rpc_mode
 
-_LOCAL_DISPATCH_ENV = "PI_PY_LOCAL_DISPATCH"
+_LOCAL_DISPATCH_ENV = "TAU_LOCAL_DISPATCH"
+_LEGACY_LOCAL_DISPATCH_ENV = "PI_PY_LOCAL_DISPATCH"
 
 
 def _find_local_project_root(cwd: str) -> str | None:
@@ -66,11 +66,64 @@ def _find_local_project_root(cwd: str) -> str | None:
     return None
 
 
-def _latest_clarity_pi_requirement() -> str:
-    with urllib.request.urlopen("https://pypi.org/pypi/tau-by-clarity/json", timeout=20) as response:
-        data = json.load(response)
-    version = str(data["info"]["version"])
-    return f"tau-by-clarity=={version}"
+def _locked_tau_version(project_root: str) -> str | None:
+    lockfile = Path(project_root) / "uv.lock"
+    try:
+        data = tomllib.loads(lockfile.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    packages = data.get("package", [])
+    if not isinstance(packages, list):
+        return None
+    for package in packages:
+        if not isinstance(package, dict) or package.get("name") != "tau-by-clarity":
+            continue
+        version = package.get("version")
+        return str(version) if version else None
+    return None
+
+
+def _update_local_project_tau(project_root: str, args: Sequence[str], env: dict[str, str]) -> int:
+    update_result = subprocess.run(
+        [
+            "uv",
+            "add",
+            "--project",
+            project_root,
+            "--upgrade-package",
+            "tau-by-clarity",
+            "tau-by-clarity>=0",
+            *args,
+        ],
+        env=env,
+    )
+    if update_result.returncode != 0:
+        return update_result.returncode
+
+    version = _locked_tau_version(project_root)
+    if not version:
+        print("Unable to determine resolved tau-by-clarity version from uv.lock.", file=sys.stderr)
+        return 1
+
+    pin_result = subprocess.run(
+        [
+            "uv",
+            "add",
+            "--project",
+            project_root,
+            f"tau-by-clarity=={version}",
+            *args,
+        ],
+        env=env,
+    )
+    if pin_result.returncode != 0:
+        return pin_result.returncode
+
+    sync_result = subprocess.run(
+        ["uv", "sync", "--project", project_root],
+        env=env,
+    )
+    return sync_result.returncode
 
 
 def _dispatch_to_local_project(args: Sequence[str], cwd: str) -> None:
@@ -80,9 +133,11 @@ def _dispatch_to_local_project(args: Sequence[str], cwd: str) -> None:
     global tau wrapper prefer the initialized project's uv environment even
     when the user's current terminal has not sourced the zsh helper yet.
     """
-    if os.environ.get(_LOCAL_DISPATCH_ENV):
+    if os.environ.get(_LOCAL_DISPATCH_ENV) or os.environ.get(_LEGACY_LOCAL_DISPATCH_ENV):
         return
     if "--init" in args:
+        return
+    if args and args[0] == "memory":
         return
     project_root = _find_local_project_root(cwd)
     if not project_root:
@@ -90,27 +145,7 @@ def _dispatch_to_local_project(args: Sequence[str], cwd: str) -> None:
     env = os.environ.copy()
     env[_LOCAL_DISPATCH_ENV] = "1"
     if args and args[0] == "update":
-        requirement = _latest_clarity_pi_requirement()
-        update_result = subprocess.run(
-            [
-                "uv",
-                "add",
-                "--project",
-                project_root,
-                "--upgrade-package",
-                "tau-by-clarity",
-                requirement,
-                *args[1:],
-            ],
-            env=env,
-        )
-        if update_result.returncode != 0:
-            raise SystemExit(update_result.returncode)
-        sync_result = subprocess.run(
-            ["uv", "sync", "--project", project_root],
-            env=env,
-        )
-        raise SystemExit(sync_result.returncode)
+        raise SystemExit(_update_local_project_tau(project_root, args[1:], env))
     os.execvpe(
         "uv",
         ["uv", "run", "--project", project_root, "python", "-m", "pi_coding_agent.main", *args],
@@ -277,7 +312,9 @@ async def _create_runtime_host(
                 resource_loader=runtime_loader,
                 tools=parsed.tools,
                 exclude_tools=getattr(parsed, "exclude_tools", None),
-                no_tools="all" if parsed.no_tools else "builtin" if getattr(parsed, "no_builtin_tools", False) else None,
+                no_tools=(
+                    "all" if parsed.no_tools else "builtin" if getattr(parsed, "no_builtin_tools", False) else None
+                ),
                 session_vars=session_vars,
             )
         )
@@ -378,6 +415,164 @@ def _resolve_project_trusted(cwd: str, agent_dir: str, trust_override: bool | No
     return not has_project_trust_inputs(cwd) or ProjectTrustStore(agent_dir).get(cwd) is True
 
 
+# ── one-shot ops: --setup-ollama / --doctor ────────────────────────────────
+
+def _run_setup_ollama(parsed: Any) -> int:
+    """Install (best-effort) + start the local Ollama service and pre-pull the
+    default embed model. Runs in foreground; prints progress; exits 0 on
+    success, non-zero on failure.
+    """
+    from .utils.ollama import (
+        DEFAULT_MODEL,
+        health,
+        pull_model,
+        start,
+    )
+    model = (getattr(parsed, "pull_model", None) or DEFAULT_MODEL)
+    print("[tau] checking ollama at http://localhost:11434 ...", file=sys.stderr)
+    h = health()
+    if h.reachable:
+        print(f"[tau] ollama already running. models: {h.models}", file=sys.stderr)
+    else:
+        print(f"[tau] {h.error or 'unreachable'}. attempting to start ...", file=sys.stderr)
+        try:
+            pid = start()
+        except FileNotFoundError as exc:
+            print(f"[tau] {exc}", file=sys.stderr)
+            print("[tau] install ollama from https://ollama.ai and re-run.", file=sys.stderr)
+            log_event("setup_ollama_no_binary", error=str(exc))
+            return 1
+        except Exception as exc:
+            print(f"[tau] start failed: {exc}", file=sys.stderr)
+            log_event("setup_ollama_start_failed", error=str(exc))
+            return 1
+        print(f"[tau] ollama started (pid {pid})", file=sys.stderr)
+    # Verify the model is available; pull if missing.
+    h2 = health()
+    have_model = any(m.split(":")[0] == model.split(":")[0] for m in (h2.models or []))
+    if not have_model:
+        print(f"[tau] pulling model {model!r} (one-time) ...", file=sys.stderr)
+        try:
+            pull_model(model)
+        except Exception as exc:
+            print(f"[tau] pull failed: {exc}", file=sys.stderr)
+            log_event("setup_ollama_pull_failed", error=str(exc))
+            return 1
+        print(f"[tau] model {model!r} pulled.", file=sys.stderr)
+    else:
+        print(f"[tau] model {model!r} already present.", file=sys.stderr)
+    h3 = health()
+    print(
+        f"[tau] DONE: ollama reachable={h3.reachable} models={h3.models} "
+        f"base_url={h3.base_url}",
+        file=sys.stderr,
+    )
+    log_event("setup_ollama_ok", model=model, reachable=h3.reachable)
+    return 0
+
+
+def _run_doctor(parsed: Any) -> int:
+    """Smoke check the runtime. Returns 0 on green, 1 on red.
+
+    Checks: settings load, ollama health (warn-only — degraded fallback OK),
+    memory db path, ccr cache path, agent_session attach path (memory_enabled
+    is the normal control plane).
+    """
+    findings: list[tuple[str, str, str]] = []  # (level, name, detail)
+
+    def _add(level: str, name: str, detail: str) -> None:
+        findings.append((level, name, detail))
+
+    cwd = os.getcwd()
+    # 1. Settings
+    try:
+        sm = SettingsManager.create(cwd, get_agent_dir(), {}, inherit_global=False)
+        settings = sm.get()
+        _add("ok", "settings",
+             f"provider={settings.default_provider} model={settings.default_model} "
+             f"thinking={settings.thinking_level}")
+    except Exception as exc:
+        _add("err", "settings", f"failed to load: {exc}")
+
+    # 2. Ollama (warn-only — the resilient embedder handles unreachable)
+    try:
+        from .utils.ollama import health
+        h = health()
+        if h.reachable:
+            _add("ok", "ollama", f"reachable models={h.models}")
+        else:
+            _add("warn", "ollama",
+                 f"unreachable at {h.base_url}: {h.error}. "
+                 f"Memory recall will use deterministic fallback. "
+                 f"Run `tau --setup-ollama` to start the service.")
+    except Exception as exc:
+        _add("err", "ollama", f"health check crashed: {exc}")
+
+    # 3. Memory db (project-local, doesn't have to exist yet)
+    try:
+        mem_dir = os.path.join(cwd, CONFIG_DIR_NAME, "memory")
+        db_path = os.path.join(mem_dir, "memory.db")
+        if os.path.exists(db_path):
+            size = os.path.getsize(db_path)
+            _add("ok", "memory.db", f"{db_path} ({size} bytes)")
+        else:
+            _add("info", "memory.db", "not yet created (will be on first memory write)")
+    except Exception as exc:
+        _add("err", "memory.db", f"check failed: {exc}")
+
+    # 4. CCR cache
+    try:
+        ccr_path = os.path.join(get_agent_dir(), "ccr.db")
+        if os.path.exists(ccr_path):
+            size = os.path.getsize(ccr_path)
+            _add("ok", "ccr.db", f"{ccr_path} ({size} bytes)")
+        else:
+            _add("info", "ccr.db", f"not yet created at {ccr_path}")
+    except Exception as exc:
+        _add("err", "ccr.db", f"check failed: {exc}")
+
+    # 5. memory_enabled resolution
+    try:
+        # memory_enabled() only sees the env-var surface; we also check settings
+        from .core.memory.integration import memory_enabled
+        from .core.settings_manager import SettingsManager as _SM
+        sm = _SM.create(cwd, get_agent_dir(), {}, inherit_global=False)
+        s = sm.get()
+        settings_flag = getattr(s, "memory_enabled", None)
+        env_disabled = (
+            os.environ.get("PI_MEMORY_DISABLED", "") == "1"
+            or os.environ.get("PI_CODING_AGENT_MEMORY_DISABLED", "") == "1"
+        )
+        env_forced = memory_enabled()
+        if env_disabled:
+            effective = False
+        elif env_forced:
+            effective = True
+        elif settings_flag is None:
+            effective = True
+        else:
+            effective = bool(settings_flag)
+        _add("ok", "memory",
+             f"effective_enabled={effective} settings_flag={settings_flag} "
+             f"env_forced_on={env_forced} env_disabled={env_disabled}")
+    except Exception as exc:
+        _add("err", "memory", f"resolution failed: {exc}")
+
+    # Render report
+    err_count = sum(1 for f in findings if f[0] == "err")
+    warn_count = sum(1 for f in findings if f[0] == "warn")
+    print("=== tau doctor ===")
+    for level, name, detail in findings:
+        marker = {"ok": "  OK", "warn": " WARN", "err": " ERR ", "info": " INFO"}.get(level, level)
+        print(f"{marker}  {name:<14} {detail}")
+    print(f"=== {len(findings)} checks: "
+          f"{sum(1 for f in findings if f[0] == 'ok')} ok, "
+          f"{warn_count} warn, {err_count} err ===")
+    log_event("doctor", ok=sum(1 for f in findings if f[0] == "ok"),
+              warn=warn_count, err=err_count)
+    return 1 if err_count else 0
+
+
 def _parse_package_command(args: Sequence[str]) -> dict[str, Any] | None:
     if not args:
         return None
@@ -472,7 +667,9 @@ def _parse_package_command(args: Sequence[str]) -> dict[str, Any] | None:
     if command == "update":
         if extension_flag_source:
             if self_flag or extensions_flag:
-                conflicting_options = conflicting_options or "--extension cannot be combined with --self or --extensions"
+                conflicting_options = (
+                    conflicting_options or "--extension cannot be combined with --self or --extensions"
+                )
             if source:
                 conflicting_options = conflicting_options or "--extension cannot be combined with a positional source"
             update_target = {"type": "extensions", "source": extension_flag_source}
@@ -532,7 +729,10 @@ def _print_package_help(command: str) -> None:
     if command == "install":
         print(f"Usage:\n  {usage}\n\nInstall a package and add it to settings.\n")
     elif command == "remove":
-        print(f"Usage:\n  {usage}\n\nRemove a package and its source from settings.\n\nAlias: {APP_NAME} uninstall <source> [-l]\n")
+        print(
+            f"Usage:\n  {usage}\n\nRemove a package and its source from settings.\n\n"
+            f"Alias: {APP_NAME} uninstall <source> [-l]\n"
+        )
     elif command == "update":
         print(
             f"Usage:\n  {usage}\n\n"
@@ -540,6 +740,122 @@ def _print_package_help(command: str) -> None:
         )
     else:
         print(f"Usage:\n  {usage}\n\nList installed packages from user and project settings.\n")
+
+
+def _parse_memory_command(args: Sequence[str]) -> dict[str, Any] | None:
+    if len(args) < 2 or args[0] != "memory":
+        return None
+    subcommand = args[1]
+    if subcommand not in {"dream"}:
+        return {
+            "command": subcommand,
+            "invalid_command": True,
+            "help": False,
+        }
+    parsed: dict[str, Any] = {
+        "command": subcommand,
+        "dry_run": True,
+        "since": None,
+        "json": False,
+        "help": False,
+        "invalid_command": False,
+        "invalid_option": None,
+        "missing_option_value": None,
+        "conflicting_options": None,
+    }
+    explicit_dry_run = False
+    explicit_apply = False
+    index = 2
+    while index < len(args):
+        arg = args[index]
+        if arg in {"-h", "--help"}:
+            parsed["help"] = True
+        elif arg == "--dry-run":
+            explicit_dry_run = True
+            parsed["dry_run"] = True
+        elif arg == "--apply":
+            explicit_apply = True
+            parsed["dry_run"] = False
+        elif arg == "--json":
+            parsed["json"] = True
+        elif arg == "--since":
+            value = args[index + 1] if index + 1 < len(args) else None
+            if not value or value.startswith("-"):
+                parsed["missing_option_value"] = arg
+            else:
+                parsed["since"] = value
+                index += 1
+        elif arg.startswith("-"):
+            parsed["invalid_option"] = parsed["invalid_option"] or arg
+        else:
+            parsed["invalid_option"] = parsed["invalid_option"] or arg
+        index += 1
+    if explicit_dry_run and explicit_apply:
+        parsed["conflicting_options"] = "--dry-run cannot be combined with --apply"
+    return parsed
+
+
+def _memory_usage() -> str:
+    return f"{APP_NAME} memory dream [--dry-run|--apply] [--since <iso|epoch>] [--json]"
+
+
+def _print_memory_help() -> None:
+    print(
+        "Usage:\n"
+        f"  {_memory_usage()}\n\n"
+        "Consolidate conversation memory into durable semantic memory. Dry-run is the default.\n"
+    )
+
+
+def _handle_memory_command(args: Sequence[str]) -> tuple[bool, int]:
+    parsed = _parse_memory_command(args)
+    if not parsed:
+        return False, 0
+    if parsed.get("help"):
+        _print_memory_help()
+        return True, 0
+    if parsed.get("invalid_command"):
+        print(f'Unknown memory command "{parsed["command"]}".', file=sys.stderr)
+        print(f"Usage: {_memory_usage()}", file=sys.stderr)
+        return True, 1
+    if parsed.get("invalid_option"):
+        print(f'Unknown option {parsed["invalid_option"]} for "memory dream".', file=sys.stderr)
+        print(f"Usage: {_memory_usage()}", file=sys.stderr)
+        return True, 1
+    if parsed.get("missing_option_value"):
+        print(f'Missing value for {parsed["missing_option_value"]}.', file=sys.stderr)
+        print(f"Usage: {_memory_usage()}", file=sys.stderr)
+        return True, 1
+    if parsed.get("conflicting_options"):
+        print(parsed["conflicting_options"], file=sys.stderr)
+        print(f"Usage: {_memory_usage()}", file=sys.stderr)
+        return True, 1
+
+    from .core.memory.dream import dream_memory, parse_since
+
+    try:
+        since = parse_since(parsed.get("since"))
+    except ValueError as exc:
+        print(f"Invalid --since value: {exc}", file=sys.stderr)
+        return True, 1
+
+    result = dream_memory(os.getcwd(), dry_run=parsed["dry_run"], since=since)
+    if parsed["json"]:
+        import json
+
+        print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+        return True, 0
+
+    mode = "dry-run" if result.dry_run else "apply"
+    print(f"memory dream ({mode})")
+    print(f"conversation rows scanned: {result.conversation_rows_scanned}")
+    print(f"proposals: {len(result.proposals)}")
+    print(f"written: {len(result.written_ids)}")
+    print(f"skipped existing: {len(result.skipped_existing)}")
+    if result.proposals:
+        for proposal in result.proposals:
+            print(f"- [{proposal.memory_type}] {proposal.title} ({proposal.status})")
+    return True, 0
 
 
 async def _handle_package_command(args: Sequence[str]) -> tuple[bool, int]:
@@ -692,6 +1008,10 @@ async def _run(args: Sequence[str]) -> int:
     if handled:
         log_event("package_command_handled", exit_code=exit_code)
         return exit_code
+    handled, exit_code = _handle_memory_command(args)
+    if handled:
+        log_event("memory_command_handled", exit_code=exit_code)
+        return exit_code
     handled, exit_code = await _handle_config_command(args)
     if handled:
         log_event("config_command_handled", exit_code=exit_code)
@@ -792,6 +1112,15 @@ async def _run(args: Sequence[str]) -> int:
             )
         if not killed:
             print("No running tau sessions.")
+
+    # One-shot ops: --setup-ollama / --doctor / --pull-model.
+    # Each runs in foreground, prints to stdout/stderr, and exits before any
+    # session is created. Keep this branch BEFORE the session_manager path so
+    # a missing ollama doesn't block setup.
+    if getattr(parsed, "setup_ollama", False) or getattr(parsed, "pull_model", None):
+        return _run_setup_ollama(parsed)
+    if getattr(parsed, "doctor", False):
+        return _run_doctor(parsed)
         log_event("kill_complete", target=target, count=len(killed))
         return 0
 
@@ -926,6 +1255,12 @@ async def _run(args: Sequence[str]) -> int:
     session = result.session
     event_unsub = attach_session_event_logging(session)
     log_session_snapshot("created", session)
+    # CLI `--goal <text>` seeds the in-memory session goal. No disk write;
+    # the goal tools (when explicitly opted in via settings.json's tools list)
+    # remain the only path to mutate the goal thereafter.
+    if getattr(parsed, "goal", None):
+        session.set_current_goal(parsed.goal)
+        log_event("goal_seeded_from_cli", session_id=session.session_id)
     if parsed.name:
         session.session_manager.append_session_info(parsed.name)
         log_event("session_named", name=parsed.name)

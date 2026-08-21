@@ -1,26 +1,27 @@
 """Tests for streaming functions (with mocked providers)."""
 from __future__ import annotations
 
-import pytest
 from unittest.mock import patch
 
+import pytest
 from pi_ai import (
-    Context,
-    UserMessage,
     AssistantMessage,
-    SimpleStreamOptions,
+    Context,
+    EventDone,
     EventStart,
-    EventTextStart,
     EventTextDelta,
     EventTextEnd,
-    EventDone,
-    EventError,
+    EventTextStart,
+    SimpleStreamOptions,
     TextContent,
     ToolResultMessage,
     Usage,
-    get_model,
-    stream_simple,
+    UserMessage,
     complete_simple,
+    get_model,
+    register_compressor,
+    stream_simple,
+    unregister_compressor,
 )
 
 
@@ -43,16 +44,6 @@ def make_assistant_message(model, text: str = "Hello!") -> AssistantMessage:
         model=model.id,
         usage=Usage(),
         stop_reason="stop",
-        timestamp=int(time.time() * 1000),
-    )
-
-
-def make_tool_result(tool_name: str, text: str) -> ToolResultMessage:
-    import time
-    return ToolResultMessage(
-        tool_call_id=f"{tool_name}-1",
-        tool_name=tool_name,
-        content=[TextContent(type="text", text=text)],
         timestamp=int(time.time() * 1000),
     )
 

@@ -90,3 +90,13 @@ def test_conversation_log_round_trip(tmp_path):
     turns = s.recent_turns()
     assert [t.role for t in turns] == ["user", "assistant"]
     s.close()
+
+
+def test_conversation_turns_since(tmp_path):
+    s = _store(tmp_path)
+    s.append_turn(ConversationTurn(id="old", project="", role="user", content="old", created_at=10))
+    s.append_turn(ConversationTurn(id="new", project="", role="user", content="new", created_at=20))
+
+    assert [t.id for t in s.turns_since()] == ["old", "new"]
+    assert [t.id for t in s.turns_since(15)] == ["new"]
+    s.close()
