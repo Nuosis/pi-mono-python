@@ -165,7 +165,14 @@ class AgentSession:
         self._extension_bindings: dict[str, Any] = {}
         self._steering_mode_override: str | None = None
         self._follow_up_mode_override: str | None = None
-        self._current_goal = self._initial_goal_from_settings()
+        self._goal_terminated: bool = False
+        self._goal: SessionGoal | None = None
+        self._initial_active_tool_names: list[str] | None = (
+            list(initial_active_tool_names)
+            if initial_active_tool_names is not None
+            else None
+        )
+        self._current_goal = self._initial_goal_from_session_vars()
         self._turn_end_finalizing = False
         self._turn_end_original_system_prompt: str | None = None
         self._turn_end_original_tools: list[Any] | None = None
