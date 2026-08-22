@@ -307,3 +307,8 @@ Keep one timeout-aware `flush`, point it at the actual `_pending` set, and
 return the scheduled task from `emit`. This restores the single contract used
 by both the runtime and the existing focused test without changing event
 payloads, provider behavior, or sink routing.
+
+The first release build used `0.56.33+voicehook4`; PyPI rejected it before
+accepting any file because public indexes do not allow local version suffixes.
+The release identifier was therefore corrected to the next public patch,
+`0.56.34`.
