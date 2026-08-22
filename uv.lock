@@ -1717,7 +1717,7 @@ wheels = [
 
 [[package]]
 name = "tau-by-clarity"
-version = "0.56.33+voicehook3"
+version = "0.56.33+voicehook4"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },

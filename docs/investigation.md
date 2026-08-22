@@ -273,3 +273,37 @@ without a local `direct_url`, then sent a live OpenRouter request with
 no error, and 16 total tokens. Interviewer was pinned, locked, and synced to
 that same public `0.56.33` build, and its literal `tau update` route resolved
 `tau-by-clarity==0.56.33`.
+
+# Tau instrumentation turn-finalization failure (2026-08-22)
+
+## Problem
+
+An instrumented Claire/Tau turn delivered its tool events but exited with
+`TypeError: flush() got an unexpected keyword argument 'timeout_seconds'`
+instead of reaching a normal assistant terminal response.
+
+## Hypothesis list
+
+| # | Hypothesis | Null hypothesis | Status |
+|---|---|---|---|
+| 1 | The eval invoked Tau with an invalid instrumentation setting. | The same error reproduces by calling the installed instrumentation boundary directly. | Null falsified: direct installed call reproduced the exact TypeError. |
+| 2 | The caller and instrumentation module disagree on the flush contract. | The imported `flush` accepts the timeout argument used by `AgentSession`. | Null falsified: runtime signature was `()` while `AgentSession` passed `timeout_seconds`. |
+| 3 | A duplicate definition displaced the intended implementation. | Only one `flush` definition exists and it uses the active pending-task set. | Null falsified: two definitions existed; the surviving one had no timeout, while the first referred to nonexistent `_pending_tasks`. |
+
+## Debug evidence
+
+- Production Gate 3 captured two delivered `tau.tool_call` and two
+  `tau.tool_result` observations, followed by the exact TypeError at turn end.
+- Direct runtime inspection reported `module_flush_signature () -> None` and a
+  minimal call reproduced the TypeError.
+- The focused pre-fix test
+  `packages/coding-agent/tests/test_clarity_instrumentation.py` failed because
+  `emit()` also did not return its scheduled task, confirming the same merge
+  had split the pending-task contract.
+
+## Repair
+
+Keep one timeout-aware `flush`, point it at the actual `_pending` set, and
+return the scheduled task from `emit`. This restores the single contract used
+by both the runtime and the existing focused test without changing event
+payloads, provider behavior, or sink routing.
