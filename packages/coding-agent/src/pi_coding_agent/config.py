@@ -13,7 +13,7 @@ from pathlib import Path
 
 # App metadata. APP_NAME is the user-facing brand shown in CLI/TUI text.
 # ENV_PREFIX is kept separate ("PI") so env var names stay PI_CODING_AGENT_*
-# for back-compat — agents (e.g. Devin) and the .pi-py convention depend on them.
+# for back-compat with existing agents and automation.
 APP_NAME: str = "tau"
 ENV_PREFIX: str = "PI"
 # The harness uses its OWN config dir (`.tau`) so it never reads the Node `.pi`
@@ -186,22 +186,22 @@ def get_share_viewer_url(gist_id: str) -> str:
 
 
 def get_global_config_dir() -> str:
-    """Get the global Pi config directory (~/.pi)."""
+    """Get the global Tau config directory (~/.tau)."""
     return get_root_config_dir()
 
 
 def get_global_agent_dir() -> str:
-    """Get the global Pi agent directory (~/.pi/agent)."""
+    """Get the global Tau agent directory (~/.tau/agent)."""
     return get_root_agent_dir()
 
 
 def get_global_sessions_dir() -> str:
-    """Get the sessions directory (~/.pi/agent/sessions)."""
+    """Get the sessions directory (~/.tau/agent/sessions)."""
     return os.path.join(get_root_agent_dir(), "sessions")
 
 
 def get_project_config_dir(cwd: str | None = None) -> str:
-    """Get the project-local Pi config directory (<cwd>/.pi-py)."""
+    """Get the project-local Tau config directory (<cwd>/.tau)."""
     base = cwd or os.getcwd()
     return os.path.join(base, CONFIG_DIR_NAME)
 
@@ -303,17 +303,31 @@ def _global_default_seed() -> dict:
         except (OSError, json.JSONDecodeError):
             pass
     # Always surface the memory toggle in a fresh project file so it's visible
-    # and one edit away from on — the flag's home is settings.json (env var only
-    # forces on for tests/CI). Inherit a global preference if one is set; else
-    # fall back to the product default (off / kill-switch retained).
-    seed["memory_enabled"] = bool(gdata.get("memory_enabled", False))
+    # and one edit away from the kill switch. Inherit a global preference if one
+    # is set; else fall back to the product default (on).
+    seed["memory_enabled"] = bool(gdata.get("memory_enabled", True))
     return seed
+
+
+def _project_a2a_seed(cwd: str | None = None) -> dict:
+    base = cwd or os.getcwd()
+    name = os.path.basename(os.path.abspath(base)) or "agent"
+    slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in name).strip("-") or "agent"
+    return {
+        "self": {
+            "slug": slug,
+            "name": name,
+            "clarity_agent_id": None,
+        },
+        "agents": [],
+        "unknown_sender_policy": "surface_for_approval",
+    }
 
 
 def ensure_project_settings(cwd: str | None = None) -> str | None:
     """Guarantee <cwd>/.tau/settings.json exists, seeded from the global
     defaults, on EVERY launch — so a normal `tau` run never leaves a
-    half-empty .pi-py (sessions dir but no visible config). If the file exists,
+    half-empty .tau (sessions dir but no visible config). If the file exists,
     fills any missing seeded defaults without overwriting project values.
     Returns the path if it was created or updated, else None."""
     import json
@@ -322,6 +336,7 @@ def ensure_project_settings(cwd: str | None = None) -> str | None:
     config_dir = get_project_config_dir(base)
     settings_path = os.path.join(config_dir, "settings.json")
     seed = _global_default_seed()
+    seed.setdefault("a2a", _project_a2a_seed(base))
     if os.path.exists(settings_path):
         try:
             with open(settings_path, encoding="utf-8") as f:
@@ -541,25 +556,15 @@ _ZSH_ALIAS_BEGIN = "# >>> tau managed shell function >>>"
 _ZSH_ALIAS_END = "# <<< tau managed shell function <<<"
 
 
-def _pi_py_zsh_function_block() -> str:
+def _tau_zsh_function_block() -> str:
     return "\n".join(
         [
             _ZSH_ALIAS_BEGIN,
             "tau() {",
-            '  if [ -f "pyproject.toml" ] && grep -q "tau-by-clarity" "pyproject.toml" && command -v uv >/dev/null 2>&1; then',
+            '  if [ -f "pyproject.toml" ] && grep -q "tau-by-clarity" "pyproject.toml" '
+            "&& command -v uv >/dev/null 2>&1; then",
             '    if [ "${1:-}" = "update" ]; then',
-            '      shift',
-            '      local _pi_py_latest',
-            "      _pi_py_latest=\"$(python3 - <<'PY'",
-            "import json",
-            "import urllib.request",
-            "",
-            'with urllib.request.urlopen("https://pypi.org/pypi/tau-by-clarity/json", timeout=20) as response:',
-            "    data = json.load(response)",
-            'print(data["info"]["version"])',
-            "PY",
-            ')"',
-            '      uv add --upgrade-package tau-by-clarity "tau-by-clarity==${_pi_py_latest}" "$@" && uv sync',
+            '      command tau "$@"',
             "    else",
             '      uv run python -m pi_coding_agent.main "$@"',
             "    fi",
@@ -573,7 +578,7 @@ def _pi_py_zsh_function_block() -> str:
     )
 
 
-def ensure_zsh_pi_py_alias(zshrc_path: str | None = None) -> str | None:
+def ensure_zsh_tau_alias(zshrc_path: str | None = None) -> str | None:
     """Install the zsh helper that prefers project-local ``uv run tau``.
 
     The block is marker-managed and idempotent. It intentionally lives behind
@@ -581,7 +586,7 @@ def ensure_zsh_pi_py_alias(zshrc_path: str | None = None) -> str | None:
     without the user explicitly initializing an agent workspace.
     """
     path = zshrc_path or os.path.join(os.path.expanduser("~"), ".zshrc")
-    block = _pi_py_zsh_function_block()
+    block = _tau_zsh_function_block()
     try:
         existing = ""
         if os.path.exists(path):
@@ -641,7 +646,7 @@ def ensure_project_gitignore(cwd: str | None = None) -> str | None:
 
 
 def scaffold_project(cwd: str | None = None) -> list[str]:
-    """Create the project-local .pi-py structure for a new agent dir.
+    """Create the project-local .tau structure for a new agent dir.
 
     Idempotent: only creates what's missing; never overwrites. Returns the list
     of paths created.
@@ -649,7 +654,7 @@ def scaffold_project(cwd: str | None = None) -> list[str]:
     import json
 
     base = cwd or os.getcwd()
-    config_dir = get_project_config_dir(base)  # <cwd>/.pi-py
+    config_dir = get_project_config_dir(base)  # <cwd>/.tau
     created: list[str] = []
 
     for sub in ("skills", "prompts", "extensions"):
@@ -666,8 +671,10 @@ def scaffold_project(cwd: str | None = None) -> list[str]:
         # self-contained right here in its own dir (not an empty {} that hides
         # what it's actually running). If no global defaults exist yet, this
         # stays empty until /login writes them.
+        settings_seed = _global_default_seed()
+        settings_seed.setdefault("a2a", _project_a2a_seed(base))
         with open(settings_path, "w", encoding="utf-8") as f:
-            f.write(json.dumps(_global_default_seed(), indent=2) + "\n")
+            f.write(json.dumps(settings_seed, indent=2) + "\n")
         created.append(settings_path)
 
     # Stand up the project-local memory store so it's present and git-trackable
@@ -682,7 +689,7 @@ def scaffold_project(cwd: str | None = None) -> list[str]:
     created.extend(ensure_project_skills(base))
     created.extend(ensure_project_agent_config(base))
     created.extend(ensure_project_uv_runner(base))
-    alias_path = ensure_zsh_pi_py_alias()
+    alias_path = ensure_zsh_tau_alias()
     if alias_path:
         created.append(alias_path)
     gitignore_path = ensure_project_gitignore(base)
