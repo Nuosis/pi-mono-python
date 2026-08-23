@@ -312,3 +312,47 @@ The first release build used `0.56.33+voicehook4`; PyPI rejected it before
 accepting any file because public indexes do not allow local version suffixes.
 The release identifier was therefore corrected to the next public patch,
 `0.56.34`.
+
+---
+
+## Anthropic dotted tool-name rejection — 2026-08-22
+
+### Problem
+
+Claire's Anthropic subscription accepted `claude-opus-4-8` with high thinking,
+but rejected the request before inference with HTTP 400 because Tau sent the
+registered tool name `world.topics` directly. Anthropic requires every tool
+name to match `^[a-zA-Z0-9_-]{1,128}$`.
+
+### Evidence and decision
+
+- The production request failed at `tools.5.custom.name`; Claire's ordered
+  debug registry showed index 5 was `world.topics`.
+- Disabling active compression removed `ccr_retrieve`, shifted the same dotted
+  tool to index 4, and produced the same validation error. Disabling PII did
+  not remove or rename the invalid tool.
+- The same subscription, model, and thinking level returned `OK` when Tau was
+  limited to five regex-safe tools, isolating authentication and model access
+  from the tool-schema failure.
+
+Repair classification: existing-capability bug in the Anthropic provider
+adapter. The adapter now owns a deterministic, collision-free bidirectional
+mapping between Tau's internal names and Anthropic-safe names; histories and
+tool definitions share the outbound mapping, and streamed tool calls are
+restored to the registered internal name before dispatch. The provider copy of
+each input schema also omits only root-level `oneOf`, `allOf`, and `anyOf`,
+which Anthropic rejects before inference; Claire's original schema remains the
+runtime validator. Claire's tool registry, compression, PII, prompts, and
+extension dispatch remain unchanged.
+
+### Verification
+
+Four focused contract tests cover regex and length enforcement, deliberate
+alias collision, history/definition consistency, root-schema transport, and an
+SDK-boundary dotted tool round trip. The broader affected
+Anthropic/OAuth/stream slice passed 92 tests; three unrelated tests failed
+identically on the untouched `0.56.34` baseline and were excluded from the
+focused gate. A wheel-isolated Claire canary then completed against the full
+tool registry using the Anthropic subscription, Opus/high thinking, and default
+compression/PII. Canary run `80bdfe822261` dispatched the provider alias back
+to `world.topics`, completed the read-only tool call, and exited zero.

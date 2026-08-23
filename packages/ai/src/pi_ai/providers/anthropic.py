@@ -14,6 +14,7 @@ Full parity including:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import re
 import time
@@ -73,6 +74,8 @@ _CLAUDE_CODE_TOOLS = [
     "WebFetch", "WebSearch",
 ]
 _CC_TOOL_LOOKUP = {t.lower(): t for t in _CLAUDE_CODE_TOOLS}
+_ANTHROPIC_TOOL_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+_ANTHROPIC_TOOL_NAME_MAX_LENGTH = 128
 
 
 def _to_claude_code_name(name: str) -> str:
@@ -89,6 +92,51 @@ def _from_claude_code_name(name: str, tools: list | None = None) -> str:
             if tname.lower() == lower:
                 return tname
     return name
+
+
+def _provider_safe_tool_name(name: str, is_oauth: bool = False) -> str:
+    """Encode a local tool name for Anthropic without losing its identity."""
+    canonical_name = _to_claude_code_name(name) if is_oauth else name
+    if (
+        len(canonical_name) <= _ANTHROPIC_TOOL_NAME_MAX_LENGTH
+        and _ANTHROPIC_TOOL_NAME_PATTERN.fullmatch(canonical_name)
+    ):
+        return canonical_name
+
+    stem = re.sub(r"[^a-zA-Z0-9_-]", "_", canonical_name).strip("_") or "tool"
+    suffix = hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
+    stem_limit = _ANTHROPIC_TOOL_NAME_MAX_LENGTH - len(suffix) - 1
+    return f"{stem[:stem_limit]}_{suffix}"
+
+
+def _build_tool_name_maps(
+    tools: list | None,
+    is_oauth: bool = False,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Build collision-free maps between Tau and Anthropic tool names."""
+    internal_to_provider: dict[str, str] = {}
+    provider_to_internal: dict[str, str] = {}
+    for tool in tools or []:
+        internal_name = tool.name if hasattr(tool, "name") else tool.get("name", "")
+        candidate = _provider_safe_tool_name(internal_name, is_oauth)
+        collision_index = 1
+        while candidate in provider_to_internal:
+            candidate = _provider_safe_tool_name(
+                f"{internal_name}#{collision_index}", is_oauth
+            )
+            collision_index += 1
+        internal_to_provider[internal_name] = candidate
+        provider_to_internal[candidate] = internal_name
+    return internal_to_provider, provider_to_internal
+
+
+def _provider_safe_input_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Remove combinators Anthropic rejects at the input-schema root."""
+    return {
+        key: value
+        for key, value in schema.items()
+        if key not in {"oneOf", "allOf", "anyOf"}
+    }
 
 
 def _is_oauth_token(api_key: str) -> bool:
@@ -262,6 +310,7 @@ def _build_messages(
     context: Context,
     is_oauth: bool = False,
     cache_control: dict | None = None,
+    tool_name_map: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Convert Context messages to Anthropic API format.
@@ -327,7 +376,10 @@ def _build_messages(
                             "signature": block.thinking_signature or "",
                         })
                 elif isinstance(block, ToolCall):
-                    tc_name = _to_claude_code_name(block.name) if is_oauth else block.name
+                    tc_name = (tool_name_map or {}).get(
+                        block.name,
+                        _provider_safe_tool_name(block.name, is_oauth),
+                    )
                     content_blocks.append({
                         "type": "tool_use",
                         "id": block.id,
@@ -355,17 +407,24 @@ def _build_messages(
     return result
 
 
-def _build_tools(context: Context, is_oauth: bool = False) -> list[dict[str, Any]] | None:
+def _build_tools(
+    context: Context,
+    is_oauth: bool = False,
+    tool_name_map: dict[str, str] | None = None,
+) -> list[dict[str, Any]] | None:
     """Convert Context tools to Anthropic API format, with Claude Code name normalization."""
     if not context.tools:
         return None
     tools = []
     for tool in context.tools:
-        name = _to_claude_code_name(tool.name) if is_oauth else tool.name
+        name = (tool_name_map or {}).get(
+            tool.name,
+            _provider_safe_tool_name(tool.name, is_oauth),
+        )
         tools.append({
             "name": name,
             "description": tool.description,
-            "input_schema": tool.parameters,
+            "input_schema": _provider_safe_input_schema(tool.parameters),
         })
     return tools
 
@@ -513,8 +572,20 @@ async def stream_simple(
         tools=context.tools,
     )
 
-    messages = _build_messages(transformed_context, is_oauth=is_oauth, cache_control=cache_control)
-    tools = _build_tools(transformed_context, is_oauth=is_oauth)
+    internal_tool_name_map, provider_tool_name_map = _build_tool_name_maps(
+        list(transformed_context.tools or []), is_oauth=is_oauth
+    )
+    messages = _build_messages(
+        transformed_context,
+        is_oauth=is_oauth,
+        cache_control=cache_control,
+        tool_name_map=internal_tool_name_map,
+    )
+    tools = _build_tools(
+        transformed_context,
+        is_oauth=is_oauth,
+        tool_name_map=internal_tool_name_map,
+    )
     system = _build_system(transformed_context, is_oauth=is_oauth, cache_control=cache_control)
 
     max_tokens = opts.max_tokens or (model.max_tokens // 3 if model.max_tokens else 4096)
@@ -660,9 +731,13 @@ async def stream_simple(
                         yield EventThinkingEnd(type="thinking_end", content_index=cb_idx, content="[Reasoning redacted]", partial=partial)
 
                     elif block.type == "tool_use":
-                        tc_name = block.name
-                        if is_oauth:
-                            tc_name = _from_claude_code_name(tc_name, context.tools)
+                        tc_name = provider_tool_name_map.get(block.name)
+                        if tc_name is None:
+                            tc_name = (
+                                _from_claude_code_name(block.name, context.tools)
+                                if is_oauth
+                                else block.name
+                            )
                         tc = ToolCall(
                             type="toolCall",
                             id=block.id,
