@@ -356,6 +356,114 @@ class TestAnthropicProviderAuth:
         assert "X-Api-Key" not in kwargs["default_headers"]
 
 
+class TestAnthropicToolNames:
+    def test_anthropic_tool_name_map_is_safe_collision_free_and_reversible(self):
+        import re
+
+        from pi_ai.providers.anthropic import (
+            _build_tool_name_maps,
+            _provider_safe_tool_name,
+        )
+        from pi_ai.types import Tool
+
+        dotted_provider_name = _provider_safe_tool_name(
+            "world.topics", is_oauth=True
+        )
+        tools = [
+            Tool(name="read", description="Read", parameters={}),
+            Tool(name="world.topics", description="Topics", parameters={}),
+            Tool(
+                name=dotted_provider_name,
+                description="Safe collision",
+                parameters={},
+            ),
+            Tool(name="action." + "x" * 160, description="Long", parameters={}),
+        ]
+
+        internal_to_provider, provider_to_internal = _build_tool_name_maps(
+            tools, is_oauth=True
+        )
+
+        assert internal_to_provider["read"] == "Read"
+        assert len(set(internal_to_provider.values())) == len(tools)
+        assert all(
+            len(name) <= 128 and re.fullmatch(r"[a-zA-Z0-9_-]+", name)
+            for name in internal_to_provider.values()
+        )
+        assert {
+            provider_to_internal[provider_name]: provider_name
+            for provider_name in internal_to_provider.values()
+        } == internal_to_provider
+
+    def test_anthropic_history_and_tool_definitions_share_the_same_safe_name(self):
+        from pi_ai.providers.anthropic import (
+            _build_messages,
+            _build_tool_name_maps,
+            _build_tools,
+        )
+        from pi_ai.types import AssistantMessage, Context, Tool, ToolCall
+
+        tool = Tool(name="world.topics", description="Topics", parameters={})
+        context = Context(
+            messages=[
+                AssistantMessage(
+                    content=[
+                        ToolCall(
+                            id="tool_1",
+                            name="world.topics",
+                            arguments={},
+                        )
+                    ],
+                    api="anthropic-messages",
+                    provider="anthropic",
+                    model="claude-opus-4-8",
+                    timestamp=1,
+                )
+            ],
+            tools=[tool],
+        )
+        internal_to_provider, _ = _build_tool_name_maps(
+            context.tools, is_oauth=True
+        )
+
+        provider_tools = _build_tools(
+            context, is_oauth=True, tool_name_map=internal_to_provider
+        )
+        provider_messages = _build_messages(
+            context, is_oauth=True, tool_name_map=internal_to_provider
+        )
+
+        safe_name = internal_to_provider["world.topics"]
+        assert provider_tools[0]["name"] == safe_name
+        assert provider_messages[0]["content"][0]["name"] == safe_name
+
+    def test_anthropic_tools_remove_only_top_level_schema_combinators(self):
+        from pi_ai.providers.anthropic import _build_tools
+        from pi_ai.types import Context, Tool
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "value": {
+                    "oneOf": [{"type": "string"}, {"type": "integer"}],
+                }
+            },
+            "required": ["value"],
+            "allOf": [{"if": {"required": ["value"]}, "then": {}}],
+            "oneOf": [{"required": ["value"]}],
+            "anyOf": [{"required": ["value"]}],
+        }
+        tool = Tool(name="action.update", description="Update", parameters=schema)
+
+        provider_tools = _build_tools(Context(tools=[tool]), is_oauth=True)
+
+        provider_schema = provider_tools[0]["input_schema"]
+        assert not {"oneOf", "allOf", "anyOf"} & provider_schema.keys()
+        assert "oneOf" in provider_schema["properties"]["value"]
+        assert provider_schema["required"] == ["value"]
+        assert {"oneOf", "allOf", "anyOf"} <= tool.parameters.keys()
+
+
 class TestAnthropicProviderResponseInstrumentation:
     class RawProviderEvent:
         pass
@@ -484,6 +592,68 @@ class TestAnthropicProviderResponseInstrumentation:
         assert events[-1].type == "done"
         assert captured["thinking"] == {"type": "adaptive"}
         assert captured["output_config"] == {"effort": "high"}
+
+    @pytest.mark.asyncio
+    async def test_oauth_tool_name_round_trips_across_anthropic_sdk_boundary(self):
+        from pi_ai.providers import anthropic as anthropic_provider
+        from pi_ai.types import EventToolCallStart, SimpleStreamOptions, Tool
+
+        captured = {}
+
+        class RawContentBlockStartEvent:
+            index = 0
+            content_block = SimpleNamespace(
+                type="tool_use",
+                id="tool_1",
+                name="world_topics_deadbeef1234",
+            )
+
+        stream = self.FakeAnthropicStream(
+            RawContentBlockStartEvent(), self._final_message()
+        )
+
+        def start_stream(**kwargs):
+            captured.update(kwargs)
+            safe_name = kwargs["tools"][0]["name"]
+            stream.raw_event.content_block.name = safe_name
+            return self.FakeStreamContext(stream)
+
+        client = SimpleNamespace(messages=SimpleNamespace(stream=start_stream))
+        context = _make_context(
+            tools=[
+                Tool(
+                    name="world.topics",
+                    description="List topics",
+                    parameters={"type": "object", "properties": {}},
+                )
+            ]
+        )
+
+        with patch(
+            "pi_ai.providers.anthropic._build_client",
+            return_value=(client, True),
+        ):
+            events = [
+                event
+                async for event in anthropic_provider.stream_simple(
+                    _make_model(
+                        id_="claude-opus-4-8",
+                        provider="anthropic",
+                        api="anthropic-messages",
+                        reasoning=True,
+                    ),
+                    context,
+                    SimpleStreamOptions(
+                        api_key="sk-ant-oat-test", reasoning="high"
+                    ),
+                )
+            ]
+
+        assert captured["tools"][0]["name"] != "world.topics"
+        tool_start = next(
+            event for event in events if isinstance(event, EventToolCallStart)
+        )
+        assert tool_start.partial.content[0].name == "world.topics"
 
     @pytest.mark.asyncio
     async def test_anthropic_emits_partial_raw_response_when_stream_fails(self):

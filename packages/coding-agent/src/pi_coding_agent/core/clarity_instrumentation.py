@@ -148,7 +148,7 @@ def emit(
     input: Any = None,
     output: Any = None,
     metadata: dict[str, Any] | None = None,
-) -> None:
+) -> asyncio.Task[None] | None:
     """Schedule one asynchronous instrumentation event; never raises.
 
     ``name`` must be alphanumeric + ``_.:-`` per the Clarity route validator.
@@ -173,6 +173,7 @@ def emit(
         task = loop.create_task(_post(name, input, output, md))
         _pending.add(task)
         task.add_done_callback(_pending.discard)
+        return task
     except RuntimeError:
         # No running loop (rare, e.g. sync init path) — best-effort synchronous.
         try:
@@ -184,7 +185,7 @@ def emit(
 
 async def flush(*, timeout_seconds: float = 15.0) -> None:
     """Wait for already-scheduled trace posts without propagating sink failures."""
-    tasks = tuple(task for task in _pending_tasks if not task.done())
+    tasks = tuple(task for task in _pending if not task.done())
     if not tasks:
         return
     _, pending = await asyncio.wait(tasks, timeout=timeout_seconds)
@@ -194,13 +195,6 @@ async def flush(*, timeout_seconds: float = 15.0) -> None:
             len(pending),
             timeout_seconds,
         )
-
-
-async def flush() -> None:
-    """Wait for every scheduled instrumentation delivery to settle."""
-    while _pending:
-        tasks = tuple(_pending)
-        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 __all__ = ["emit", "enabled", "flush"]
