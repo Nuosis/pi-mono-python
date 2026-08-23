@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -511,6 +512,112 @@ def test_auth_storage_keeps_openai_and_anthropic_subscription_tokens_separate():
     assert auth.resolve_api_key("anthropic") == "anthropic-access"
     assert auth.get_oauth_token("openai")["oauth_provider"] == "openai-codex"
     assert auth.get_oauth_token("anthropic")["oauth_provider"] == "anthropic"
+
+
+@pytest.mark.asyncio
+async def test_auth_storage_refreshes_the_subscription_credential_written_by_login(monkeypatch):
+    from pi_ai.utils.oauth.types import OAuthCredentials
+
+    auth = AuthStorage.in_memory()
+    auth.set_oauth_token(
+        "anthropic",
+        {
+            "access_token": "expired-access",
+            "refresh_token": "stored-refresh",
+            "expires_at": 1,
+            "oauth_provider": "anthropic",
+        },
+    )
+    calls = []
+
+    async def refresh(provider, credentials):
+        calls.append((provider, credentials))
+        return OAuthCredentials(
+            refresh="rotated-refresh",
+            access="fresh-access",
+            expires=4_102_444_800_000,
+        )
+
+    monkeypatch.setattr("pi_ai.utils.oauth.refresh_oauth_token", refresh)
+
+    assert await auth.resolve_api_key_async("anthropic") == "fresh-access"
+    assert calls[0][0] == "anthropic"
+    assert calls[0][1].refresh == "stored-refresh"
+    stored = auth.get_oauth_token("anthropic")
+    assert stored["access_token"] == "fresh-access"
+    assert stored["refresh_token"] == "rotated-refresh"
+    assert stored["expires_at"] == 4_102_444_800
+    assert stored["oauth_provider"] == "anthropic"
+
+
+@pytest.mark.asyncio
+async def test_auth_storage_does_not_refresh_a_valid_subscription_credential(monkeypatch):
+    auth = AuthStorage.in_memory()
+    auth.set_oauth_token(
+        "anthropic",
+        {
+            "access_token": "valid-access",
+            "refresh_token": "stored-refresh",
+            "expires_at": 4_102_444_800,
+            "oauth_provider": "anthropic",
+        },
+    )
+
+    async def unexpected_refresh(*_args):
+        raise AssertionError("valid credentials must not be refreshed")
+
+    monkeypatch.setattr("pi_ai.utils.oauth.refresh_oauth_token", unexpected_refresh)
+
+    assert await auth.resolve_api_key_async("anthropic") == "valid-access"
+
+
+@pytest.mark.asyncio
+async def test_auth_storage_never_returns_an_expired_token_when_refresh_fails(monkeypatch):
+    auth = AuthStorage.in_memory()
+    auth.set_oauth_token(
+        "anthropic",
+        {
+            "access_token": "expired-access",
+            "refresh_token": "stored-refresh",
+            "expires_at": 1,
+            "oauth_provider": "anthropic",
+        },
+    )
+
+    async def failed_refresh(*_args):
+        raise RuntimeError("provider rejected refresh")
+
+    monkeypatch.setattr("pi_ai.utils.oauth.refresh_oauth_token", failed_refresh)
+
+    with pytest.raises(RuntimeError, match="provider rejected refresh"):
+        await auth.resolve_api_key_async("anthropic")
+    assert auth.resolve_api_key("anthropic") is None
+
+
+@pytest.mark.asyncio
+async def test_agent_session_uses_the_async_subscription_resolver():
+    from pi_coding_agent.core.agent_session import AgentSession
+
+    calls = []
+
+    class AsyncAuthStorage:
+        async def resolve_api_key_async(self, provider):
+            calls.append(provider)
+            return "fresh-access"
+
+        def resolve_api_key(self, _provider):
+            raise AssertionError("agent session must not use the stale synchronous path")
+
+        def get_oauth_token(self, _provider):
+            return {"access_token": "fresh-access"}
+
+        def get_api_key(self, _provider):
+            return None
+
+    session = SimpleNamespace(_auth_storage=AsyncAuthStorage())
+
+    assert await AgentSession._resolve_api_key(session, "anthropic") == "fresh-access"
+    assert calls == ["anthropic"]
 
 
 def test_auth_storage_file_backend_encrypts_on_write(tmp_path):

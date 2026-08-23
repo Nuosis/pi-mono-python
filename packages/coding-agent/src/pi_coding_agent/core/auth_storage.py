@@ -419,7 +419,6 @@ class AuthStorage:
                 refreshed = self._refresh_oauth_token(provider)
                 if refreshed:
                     return refreshed
-                return access_token
 
         # 3. Stored key from auth.json
         stored = self.get_api_key(provider)
@@ -432,6 +431,59 @@ class AuthStorage:
         if env_key:
             return env_key
         return self._fallback_resolver(provider) if self._fallback_resolver else None
+
+    async def resolve_api_key_async(self, provider: str) -> str | None:
+        """Resolve and refresh the credential format written by subscription login."""
+
+        oauth = self.get_oauth_token(provider)
+        if not oauth:
+            return self.resolve_api_key(provider)
+
+        access_token = oauth.get("access_token") or oauth.get("access")
+        expires_at = self._oauth_expires_at_seconds(oauth)
+        import time
+
+        if access_token and (not expires_at or expires_at > time.time()):
+            return access_token
+
+        refresh_token = oauth.get("refresh_token") or oauth.get("refresh")
+        oauth_provider = oauth.get("oauth_provider") or provider
+        if not refresh_token:
+            return self.resolve_api_key(provider)
+
+        from pi_ai.utils.oauth import refresh_oauth_token
+        from pi_ai.utils.oauth.types import OAuthCredentials
+
+        credentials = OAuthCredentials(
+            refresh=refresh_token,
+            access=access_token or "",
+            expires=int(expires_at * 1000) if expires_at else 0,
+            extra={
+                key: value
+                for key, value in oauth.items()
+                if key
+                not in {
+                    "type",
+                    "access",
+                    "access_token",
+                    "refresh",
+                    "refresh_token",
+                    "expires",
+                    "expires_at",
+                    "oauth_provider",
+                }
+            },
+        )
+        refreshed = await refresh_oauth_token(oauth_provider, credentials)
+        token = {
+            **oauth,
+            "access_token": refreshed.access,
+            "refresh_token": refreshed.refresh,
+            "expires_at": refreshed.expires / 1000 if refreshed.expires else 0,
+            "oauth_provider": oauth_provider,
+        }
+        self.set_oauth_token(provider, token)
+        return refreshed.access
 
     def is_using_oauth(self, provider: str) -> bool:
         """Check if provider uses OAuth authentication."""
@@ -597,6 +649,7 @@ AuthStorage.setRuntimeApiKey = AuthStorage.set_runtime_api_key
 AuthStorage.removeRuntimeApiKey = AuthStorage.remove_runtime_api_key
 AuthStorage.setFallbackResolver = AuthStorage.set_fallback_resolver
 AuthStorage.resolveApiKey = AuthStorage.resolve_api_key
+AuthStorage.resolveApiKeyAsync = AuthStorage.resolve_api_key_async
 AuthStorage.getApiKey = AuthStorage.get_api_key
 AuthStorage.setApiKey = AuthStorage.set_api_key
 AuthStorage.deleteApiKey = AuthStorage.delete_api_key

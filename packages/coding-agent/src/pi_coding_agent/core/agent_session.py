@@ -809,7 +809,11 @@ class AgentSession:
         return messages
 
     async def _resolve_api_key(self, provider: str) -> str | None:
-        key = self._auth_storage.resolve_api_key(provider)
+        async_resolver = getattr(self._auth_storage, "resolve_api_key_async", None)
+        if callable(async_resolver):
+            key = await async_resolver(provider)
+        else:
+            key = self._auth_storage.resolve_api_key(provider)
         try:
             from .cli_debug_log import log_event
 
@@ -818,7 +822,7 @@ class AgentSession:
             stored_key = self._auth_storage.get_api_key(provider)
             if provider in getattr(self._auth_storage, "_runtime_overrides", {}):
                 source = "runtime"
-            elif oauth and key == oauth.get("access_token"):
+            elif oauth and key in {oauth.get("access_token"), oauth.get("access")}:
                 source = "token"
             elif stored_key and key == stored_key:
                 source = "api_key"

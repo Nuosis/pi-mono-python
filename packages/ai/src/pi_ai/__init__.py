@@ -71,6 +71,7 @@ from .models import calculate_cost, get_model, get_models, get_providers, models
 
 # Universal PII filter hook (registered by clarity_pii; no-op otherwise)
 from .pii import has_pii_filter, register_pii_filter, unregister_pii_filter
+from .utils.overflow import get_overflow_patterns, is_context_overflow
 
 # Streaming functions
 from .stream import complete, complete_simple, stream, stream_simple
