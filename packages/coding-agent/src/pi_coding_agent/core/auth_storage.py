@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import json
 import os
+import asyncio
 import base64
 import hashlib
 import hmac
 import secrets
+from contextlib import asynccontextmanager
 from pi_coding_agent.config import CONFIG_DIR_NAME
 from pathlib import Path
 from typing import Any, Callable, Awaitable
@@ -63,6 +65,41 @@ class FileAuthStorageBackend(AuthStorageBackend):
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(result["next"])
         return result.get("result")
+
+    @asynccontextmanager
+    async def refresh_lock(self):
+        """Serialize rotating OAuth refreshes across Tau processes."""
+
+        lock_path = f"{self.auth_path}.refresh.lock"
+        os.makedirs(os.path.dirname(lock_path), mode=0o700, exist_ok=True)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        handle = os.fdopen(fd, "r+b", buffering=0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                if os.path.getsize(lock_path) == 0:
+                    handle.write(b"\0")
+                handle.seek(0)
+                await asyncio.to_thread(msvcrt.locking, handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                await asyncio.to_thread(fcntl.flock, handle.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
 
 
 class InMemoryAuthStorageBackend(AuthStorageBackend):
@@ -419,7 +456,6 @@ class AuthStorage:
                 refreshed = self._refresh_oauth_token(provider)
                 if refreshed:
                     return refreshed
-                return access_token
 
         # 3. Stored key from auth.json
         stored = self.get_api_key(provider)
@@ -432,6 +468,95 @@ class AuthStorage:
         if env_key:
             return env_key
         return self._fallback_resolver(provider) if self._fallback_resolver else None
+
+    async def resolve_api_key_async(self, provider: str) -> str | None:
+        """Resolve and refresh the credential format written by subscription login."""
+
+        if provider in self._runtime_overrides:
+            return self._runtime_overrides[provider]
+
+        oauth = self.get_oauth_token(provider)
+        if not oauth:
+            return self.resolve_api_key(provider)
+
+        access_token = oauth.get("access_token") or oauth.get("access")
+        expires_at = self._oauth_expires_at_seconds(oauth)
+        import time
+
+        if access_token and (not expires_at or expires_at > time.time()):
+            return access_token
+
+        refresh_token = oauth.get("refresh_token") or oauth.get("refresh")
+        if not refresh_token:
+            return self.resolve_api_key(provider)
+
+        refresh_lock = getattr(self._storage, "refresh_lock", None)
+        if self._storage is None:
+            refresh_lock = FileAuthStorageBackend(self.AUTH_FILE).refresh_lock
+        if callable(refresh_lock):
+            async with refresh_lock():
+                self.reload()
+                return await self._refresh_stored_oauth(provider)
+        return await self._refresh_stored_oauth(provider)
+
+    async def _refresh_stored_oauth(self, provider: str) -> str | None:
+        """Refresh OAuth after any shared-file lock has been acquired."""
+
+        if provider in self._runtime_overrides:
+            return self._runtime_overrides[provider]
+
+        oauth = self.get_oauth_token(provider)
+        if not oauth:
+            return self.resolve_api_key(provider)
+
+        access_token = oauth.get("access_token") or oauth.get("access")
+        expires_at = self._oauth_expires_at_seconds(oauth)
+        import time
+
+        if access_token and (not expires_at or expires_at > time.time()):
+            return access_token
+
+        refresh_token = oauth.get("refresh_token") or oauth.get("refresh")
+        oauth_provider = oauth.get("oauth_provider") or provider
+        if not refresh_token:
+            return self.resolve_api_key(provider)
+
+        from pi_ai.utils.oauth import refresh_oauth_token
+        from pi_ai.utils.oauth.types import OAuthCredentials
+
+        credentials = OAuthCredentials(
+            refresh=refresh_token,
+            access=access_token or "",
+            expires=int(expires_at * 1000) if expires_at else 0,
+            extra={
+                key: value
+                for key, value in oauth.items()
+                if key
+                not in {
+                    "type",
+                    "access",
+                    "access_token",
+                    "refresh",
+                    "refresh_token",
+                    "expires",
+                    "expires_at",
+                    "oauth_provider",
+                }
+            },
+        )
+        refreshed = await refresh_oauth_token(oauth_provider, credentials)
+        token = {
+            **oauth,
+            "access_token": refreshed.access,
+            "refresh_token": refreshed.refresh,
+            "expires_at": refreshed.expires / 1000 if refreshed.expires else 0,
+            "access": refreshed.access,
+            "refresh": refreshed.refresh,
+            "expires": refreshed.expires,
+            "oauth_provider": oauth_provider,
+        }
+        self.set_oauth_token(provider, token)
+        return refreshed.access
 
     def is_using_oauth(self, provider: str) -> bool:
         """Check if provider uses OAuth authentication."""
@@ -597,6 +722,7 @@ AuthStorage.setRuntimeApiKey = AuthStorage.set_runtime_api_key
 AuthStorage.removeRuntimeApiKey = AuthStorage.remove_runtime_api_key
 AuthStorage.setFallbackResolver = AuthStorage.set_fallback_resolver
 AuthStorage.resolveApiKey = AuthStorage.resolve_api_key
+AuthStorage.resolveApiKeyAsync = AuthStorage.resolve_api_key_async
 AuthStorage.getApiKey = AuthStorage.get_api_key
 AuthStorage.setApiKey = AuthStorage.set_api_key
 AuthStorage.deleteApiKey = AuthStorage.delete_api_key

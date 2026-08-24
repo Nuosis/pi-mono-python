@@ -4,9 +4,11 @@ Updated to use the new per-session SessionManager API.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -511,6 +513,180 @@ def test_auth_storage_keeps_openai_and_anthropic_subscription_tokens_separate():
     assert auth.resolve_api_key("anthropic") == "anthropic-access"
     assert auth.get_oauth_token("openai")["oauth_provider"] == "openai-codex"
     assert auth.get_oauth_token("anthropic")["oauth_provider"] == "anthropic"
+
+
+@pytest.mark.asyncio
+async def test_auth_storage_refreshes_the_subscription_credential_written_by_login(tmp_path, monkeypatch):
+    from pi_ai.utils.oauth.types import OAuthCredentials
+
+    auth_path = tmp_path / "auth.json"
+    auth = AuthStorage.create(str(auth_path))
+    auth.set_oauth_token(
+        "anthropic",
+        {
+            "access_token": "expired-access",
+            "refresh_token": "stored-refresh",
+            "expires_at": 1,
+            "oauth_provider": "anthropic",
+        },
+    )
+    calls = []
+
+    async def refresh(provider, credentials):
+        calls.append((provider, credentials))
+        return OAuthCredentials(
+            refresh="rotated-refresh",
+            access="fresh-access",
+            expires=4_102_444_800_000,
+        )
+
+    monkeypatch.setattr("pi_ai.utils.oauth.refresh_oauth_token", refresh)
+
+    assert await auth.resolve_api_key_async("anthropic") == "fresh-access"
+    assert calls[0][0] == "anthropic"
+    assert calls[0][1].refresh == "stored-refresh"
+    stored = AuthStorage.create(str(auth_path)).get_oauth_token("anthropic")
+    assert stored["access_token"] == "fresh-access"
+    assert stored["refresh_token"] == "rotated-refresh"
+    assert stored["expires_at"] == 4_102_444_800
+    assert stored["access"] == "fresh-access"
+    assert stored["refresh"] == "rotated-refresh"
+    assert stored["expires"] == 4_102_444_800_000
+    assert stored["oauth_provider"] == "anthropic"
+
+
+@pytest.mark.asyncio
+async def test_auth_storage_does_not_refresh_a_valid_subscription_credential(monkeypatch):
+    auth = AuthStorage.in_memory()
+    auth.set_oauth_token(
+        "anthropic",
+        {
+            "access_token": "valid-access",
+            "refresh_token": "stored-refresh",
+            "expires_at": 4_102_444_800,
+            "oauth_provider": "anthropic",
+        },
+    )
+
+    async def unexpected_refresh(*_args):
+        raise AssertionError("valid credentials must not be refreshed")
+
+    monkeypatch.setattr("pi_ai.utils.oauth.refresh_oauth_token", unexpected_refresh)
+
+    assert await auth.resolve_api_key_async("anthropic") == "valid-access"
+
+
+@pytest.mark.asyncio
+async def test_async_auth_resolution_preserves_runtime_override_precedence(monkeypatch):
+    auth = AuthStorage.in_memory()
+    auth.set_oauth_token(
+        "anthropic",
+        {
+            "access_token": "expired-access",
+            "refresh_token": "stored-refresh",
+            "expires_at": 1,
+            "oauth_provider": "anthropic",
+        },
+    )
+    auth.set_runtime_api_key("anthropic", "runtime-key")
+
+    async def unexpected_refresh(*_args):
+        raise AssertionError("runtime override must bypass stored OAuth refresh")
+
+    monkeypatch.setattr("pi_ai.utils.oauth.refresh_oauth_token", unexpected_refresh)
+
+    assert await auth.resolve_api_key_async("anthropic") == "runtime-key"
+
+
+@pytest.mark.asyncio
+async def test_default_file_auth_serializes_rotating_refresh_across_instances(tmp_path, monkeypatch):
+    from pi_ai.utils.oauth.types import OAuthCredentials
+
+    auth_path = tmp_path / "auth.json"
+    monkeypatch.setattr(AuthStorage, "AUTH_FILE", str(auth_path))
+    writer = AuthStorage()
+    writer.set_oauth_token(
+        "anthropic",
+        {
+            "access_token": "expired-access",
+            "refresh_token": "stored-refresh",
+            "expires_at": 1,
+            "oauth_provider": "anthropic",
+        },
+    )
+    first = AuthStorage()
+    second = AuthStorage()
+    refresh_calls = 0
+
+    async def refresh(_provider, _credentials):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        await asyncio.sleep(0.05)
+        return OAuthCredentials(
+            refresh="rotated-refresh",
+            access="fresh-access",
+            expires=4_102_444_800_000,
+        )
+
+    monkeypatch.setattr("pi_ai.utils.oauth.refresh_oauth_token", refresh)
+
+    assert await asyncio.gather(
+        first.resolve_api_key_async("anthropic"),
+        second.resolve_api_key_async("anthropic"),
+    ) == ["fresh-access", "fresh-access"]
+    assert refresh_calls == 1
+    lock_path = f"{auth_path}.refresh.lock"
+    assert os.path.exists(lock_path)
+    assert os.stat(lock_path).st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+async def test_auth_storage_never_returns_an_expired_token_when_refresh_fails(monkeypatch):
+    auth = AuthStorage.in_memory()
+    auth.set_oauth_token(
+        "anthropic",
+        {
+            "access_token": "expired-access",
+            "refresh_token": "stored-refresh",
+            "expires_at": 1,
+            "oauth_provider": "anthropic",
+        },
+    )
+
+    async def failed_refresh(*_args):
+        raise RuntimeError("provider rejected refresh")
+
+    monkeypatch.setattr("pi_ai.utils.oauth.refresh_oauth_token", failed_refresh)
+
+    with pytest.raises(RuntimeError, match="provider rejected refresh"):
+        await auth.resolve_api_key_async("anthropic")
+    assert auth.resolve_api_key("anthropic") is None
+
+
+@pytest.mark.asyncio
+async def test_agent_session_uses_the_async_subscription_resolver():
+    from pi_coding_agent.core.agent_session import AgentSession
+
+    calls = []
+
+    class AsyncAuthStorage:
+        async def resolve_api_key_async(self, provider):
+            calls.append(provider)
+            return "fresh-access"
+
+        def resolve_api_key(self, _provider):
+            raise AssertionError("agent session must not use the stale synchronous path")
+
+        def get_oauth_token(self, _provider):
+            return {"access_token": "fresh-access"}
+
+        def get_api_key(self, _provider):
+            return None
+
+    session = SimpleNamespace(_auth_storage=AsyncAuthStorage())
+
+    assert await AgentSession._resolve_api_key(session, "anthropic") == "fresh-access"
+    assert calls == ["anthropic"]
 
 
 def test_auth_storage_file_backend_encrypts_on_write(tmp_path):
