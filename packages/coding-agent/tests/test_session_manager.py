@@ -599,11 +599,12 @@ async def test_async_auth_resolution_preserves_runtime_override_precedence(monke
 
 
 @pytest.mark.asyncio
-async def test_file_auth_serializes_rotating_refresh_across_instances(tmp_path, monkeypatch):
+async def test_default_file_auth_serializes_rotating_refresh_across_instances(tmp_path, monkeypatch):
     from pi_ai.utils.oauth.types import OAuthCredentials
 
     auth_path = tmp_path / "auth.json"
-    writer = AuthStorage.create(str(auth_path))
+    monkeypatch.setattr(AuthStorage, "AUTH_FILE", str(auth_path))
+    writer = AuthStorage()
     writer.set_oauth_token(
         "anthropic",
         {
@@ -613,8 +614,8 @@ async def test_file_auth_serializes_rotating_refresh_across_instances(tmp_path, 
             "oauth_provider": "anthropic",
         },
     )
-    first = AuthStorage.create(str(auth_path))
-    second = AuthStorage.create(str(auth_path))
+    first = AuthStorage()
+    second = AuthStorage()
     refresh_calls = 0
 
     async def refresh(_provider, _credentials):
@@ -634,6 +635,9 @@ async def test_file_auth_serializes_rotating_refresh_across_instances(tmp_path, 
         second.resolve_api_key_async("anthropic"),
     ) == ["fresh-access", "fresh-access"]
     assert refresh_calls == 1
+    lock_path = f"{auth_path}.refresh.lock"
+    assert os.path.exists(lock_path)
+    assert os.stat(lock_path).st_mode & 0o777 == 0o600
 
 
 @pytest.mark.asyncio

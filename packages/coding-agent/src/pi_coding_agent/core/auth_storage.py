@@ -491,6 +491,8 @@ class AuthStorage:
             return self.resolve_api_key(provider)
 
         refresh_lock = getattr(self._storage, "refresh_lock", None)
+        if self._storage is None:
+            refresh_lock = FileAuthStorageBackend(self.AUTH_FILE).refresh_lock
         if callable(refresh_lock):
             async with refresh_lock():
                 self.reload()
