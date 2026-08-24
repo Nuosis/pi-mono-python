@@ -480,6 +480,9 @@ class AuthStorage:
             "access_token": refreshed.access,
             "refresh_token": refreshed.refresh,
             "expires_at": refreshed.expires / 1000 if refreshed.expires else 0,
+            "access": refreshed.access,
+            "refresh": refreshed.refresh,
+            "expires": refreshed.expires,
             "oauth_provider": oauth_provider,
         }
         self.set_oauth_token(provider, token)

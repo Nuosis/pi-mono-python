@@ -515,10 +515,11 @@ def test_auth_storage_keeps_openai_and_anthropic_subscription_tokens_separate():
 
 
 @pytest.mark.asyncio
-async def test_auth_storage_refreshes_the_subscription_credential_written_by_login(monkeypatch):
+async def test_auth_storage_refreshes_the_subscription_credential_written_by_login(tmp_path, monkeypatch):
     from pi_ai.utils.oauth.types import OAuthCredentials
 
-    auth = AuthStorage.in_memory()
+    auth_path = tmp_path / "auth.json"
+    auth = AuthStorage.create(str(auth_path))
     auth.set_oauth_token(
         "anthropic",
         {
@@ -543,10 +544,13 @@ async def test_auth_storage_refreshes_the_subscription_credential_written_by_log
     assert await auth.resolve_api_key_async("anthropic") == "fresh-access"
     assert calls[0][0] == "anthropic"
     assert calls[0][1].refresh == "stored-refresh"
-    stored = auth.get_oauth_token("anthropic")
+    stored = AuthStorage.create(str(auth_path)).get_oauth_token("anthropic")
     assert stored["access_token"] == "fresh-access"
     assert stored["refresh_token"] == "rotated-refresh"
     assert stored["expires_at"] == 4_102_444_800
+    assert stored["access"] == "fresh-access"
+    assert stored["refresh"] == "rotated-refresh"
+    assert stored["expires"] == 4_102_444_800_000
     assert stored["oauth_provider"] == "anthropic"
 
 
