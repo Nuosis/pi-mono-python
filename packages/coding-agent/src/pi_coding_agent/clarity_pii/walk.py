@@ -74,68 +74,11 @@ def dict_string_slots(
             yield from list_string_slots(val, skip_keys=skip_keys)
 
 
-_PROVIDER_PROTOCOL_KEYS = frozenset(
-    {
-        "api",
-        "model",
-        "name",
-        "object",
-        "provider",
-        "role",
-        "status",
-        "stop_reason",
-        "type",
-    }
-)
-
-
-def _is_provider_protocol_key(key: str) -> bool:
-    """Return whether a provider payload field is opaque protocol metadata.
-
-    Provider-generated identifiers are not model-visible prose. Rewriting them
-    breaks the causal join between a function call and its output, and some
-    providers reject the resulting punctuation outright. Content-bearing
-    fields such as ``arguments``, ``output``, ``text``, and ``instructions``
-    remain eligible for tokenization.
-    """
-
-    normalized = key.lower()
-    return (
-        normalized == "id"
-        or normalized.endswith("_id")
-        or normalized.endswith("_ids")
-        or normalized in _PROVIDER_PROTOCOL_KEYS
-    )
-
-
-def provider_payload_string_slots(
-    d: dict[str, Any],
-) -> Iterable[tuple[Callable[[], str], Callable[[str], None]]]:
-    """Yield editable model-visible strings without touching protocol fields."""
-
-    for key, val in list(d.items()):
-        if isinstance(val, str):
-            if not _is_provider_protocol_key(key):
-                yield (lambda k=key: d[k], lambda v, k=key: d.__setitem__(k, v))
-        elif isinstance(val, dict):
-            yield from provider_payload_string_slots(val)
-        elif isinstance(val, list):
-            yield from _provider_payload_list_string_slots(val)
-
-
-def _provider_payload_list_string_slots(
+def list_string_slots(
     lst: list[Any],
+    *,
+    skip_keys: set[str] | frozenset[str] | None = None,
 ) -> Iterable[tuple[Callable[[], str], Callable[[str], None]]]:
-    for i, val in enumerate(lst):
-        if isinstance(val, str):
-            yield (lambda i=i: lst[i], lambda v, i=i: lst.__setitem__(i, v))
-        elif isinstance(val, dict):
-            yield from provider_payload_string_slots(val)
-        elif isinstance(val, list):
-            yield from _provider_payload_list_string_slots(val)
-
-
-def list_string_slots(lst: list[Any]) -> Iterable[tuple[Callable[[], str], Callable[[str], None]]]:
     for i, val in enumerate(lst):
         if isinstance(val, str):
             yield (lambda i=i: lst[i], lambda v, i=i: lst.__setitem__(i, v))
