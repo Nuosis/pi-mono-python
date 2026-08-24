@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import json
 import os
+import asyncio
 import base64
 import hashlib
 import hmac
 import secrets
+from contextlib import asynccontextmanager
 from pi_coding_agent.config import CONFIG_DIR_NAME
 from pathlib import Path
 from typing import Any, Callable, Awaitable
@@ -63,6 +65,41 @@ class FileAuthStorageBackend(AuthStorageBackend):
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(result["next"])
         return result.get("result")
+
+    @asynccontextmanager
+    async def refresh_lock(self):
+        """Serialize rotating OAuth refreshes across Tau processes."""
+
+        lock_path = f"{self.auth_path}.refresh.lock"
+        os.makedirs(os.path.dirname(lock_path), mode=0o700, exist_ok=True)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        handle = os.fdopen(fd, "r+b", buffering=0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                if os.path.getsize(lock_path) == 0:
+                    handle.write(b"\0")
+                handle.seek(0)
+                await asyncio.to_thread(msvcrt.locking, handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                await asyncio.to_thread(fcntl.flock, handle.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
 
 
 class InMemoryAuthStorageBackend(AuthStorageBackend):
@@ -434,6 +471,37 @@ class AuthStorage:
 
     async def resolve_api_key_async(self, provider: str) -> str | None:
         """Resolve and refresh the credential format written by subscription login."""
+
+        if provider in self._runtime_overrides:
+            return self._runtime_overrides[provider]
+
+        oauth = self.get_oauth_token(provider)
+        if not oauth:
+            return self.resolve_api_key(provider)
+
+        access_token = oauth.get("access_token") or oauth.get("access")
+        expires_at = self._oauth_expires_at_seconds(oauth)
+        import time
+
+        if access_token and (not expires_at or expires_at > time.time()):
+            return access_token
+
+        refresh_token = oauth.get("refresh_token") or oauth.get("refresh")
+        if not refresh_token:
+            return self.resolve_api_key(provider)
+
+        refresh_lock = getattr(self._storage, "refresh_lock", None)
+        if callable(refresh_lock):
+            async with refresh_lock():
+                self.reload()
+                return await self._refresh_stored_oauth(provider)
+        return await self._refresh_stored_oauth(provider)
+
+    async def _refresh_stored_oauth(self, provider: str) -> str | None:
+        """Refresh OAuth after any shared-file lock has been acquired."""
+
+        if provider in self._runtime_overrides:
+            return self._runtime_overrides[provider]
 
         oauth = self.get_oauth_token(provider)
         if not oauth:

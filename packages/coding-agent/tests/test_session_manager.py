@@ -4,6 +4,7 @@ Updated to use the new per-session SessionManager API.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
@@ -573,6 +574,66 @@ async def test_auth_storage_does_not_refresh_a_valid_subscription_credential(mon
     monkeypatch.setattr("pi_ai.utils.oauth.refresh_oauth_token", unexpected_refresh)
 
     assert await auth.resolve_api_key_async("anthropic") == "valid-access"
+
+
+@pytest.mark.asyncio
+async def test_async_auth_resolution_preserves_runtime_override_precedence(monkeypatch):
+    auth = AuthStorage.in_memory()
+    auth.set_oauth_token(
+        "anthropic",
+        {
+            "access_token": "expired-access",
+            "refresh_token": "stored-refresh",
+            "expires_at": 1,
+            "oauth_provider": "anthropic",
+        },
+    )
+    auth.set_runtime_api_key("anthropic", "runtime-key")
+
+    async def unexpected_refresh(*_args):
+        raise AssertionError("runtime override must bypass stored OAuth refresh")
+
+    monkeypatch.setattr("pi_ai.utils.oauth.refresh_oauth_token", unexpected_refresh)
+
+    assert await auth.resolve_api_key_async("anthropic") == "runtime-key"
+
+
+@pytest.mark.asyncio
+async def test_file_auth_serializes_rotating_refresh_across_instances(tmp_path, monkeypatch):
+    from pi_ai.utils.oauth.types import OAuthCredentials
+
+    auth_path = tmp_path / "auth.json"
+    writer = AuthStorage.create(str(auth_path))
+    writer.set_oauth_token(
+        "anthropic",
+        {
+            "access_token": "expired-access",
+            "refresh_token": "stored-refresh",
+            "expires_at": 1,
+            "oauth_provider": "anthropic",
+        },
+    )
+    first = AuthStorage.create(str(auth_path))
+    second = AuthStorage.create(str(auth_path))
+    refresh_calls = 0
+
+    async def refresh(_provider, _credentials):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        await asyncio.sleep(0.05)
+        return OAuthCredentials(
+            refresh="rotated-refresh",
+            access="fresh-access",
+            expires=4_102_444_800_000,
+        )
+
+    monkeypatch.setattr("pi_ai.utils.oauth.refresh_oauth_token", refresh)
+
+    assert await asyncio.gather(
+        first.resolve_api_key_async("anthropic"),
+        second.resolve_api_key_async("anthropic"),
+    ) == ["fresh-access", "fresh-access"]
+    assert refresh_calls == 1
 
 
 @pytest.mark.asyncio
