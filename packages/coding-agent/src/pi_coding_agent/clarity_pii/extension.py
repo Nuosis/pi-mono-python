@@ -20,7 +20,7 @@ from typing import Any
 # `pi_ext_extension`), so relative imports would have no parent package. The
 # clarity_pii package is installed/importable, so absolute imports resolve.
 from pi_coding_agent.clarity_pii import set_active_vault
-from pi_coding_agent.clarity_pii.detect import get_presidio
+from pi_coding_agent.clarity_pii.detect import detect, get_presidio
 from pi_coding_agent.clarity_pii.vault import Vault, load_artifact, save_artifact
 from pi_coding_agent.clarity_pii.walk import (
     apply_to_message,
@@ -31,6 +31,11 @@ from pi_coding_agent.clarity_pii.walk import (
 
 BRAND = "Tau by Clarity"
 FLAG_NAME = "pii-filter"
+PLACEHOLDER_GUIDANCE = (
+    "Privacy placeholders such as [PII:EMAIL:1] are complete usable source values. "
+    "Copy them unchanged wherever the corresponding value is needed; Tau restores "
+    "the original locally before execution."
+)
 
 
 def _vault_dir() -> str:
@@ -82,6 +87,20 @@ def extension_factory(pi: Any) -> None:
         _load(getattr(ctx, "session_id", "") or "")
 
     pi.on("session_start", on_session_start)
+
+    async def on_before_agent_start(
+        event: dict[str, Any], ctx: Any
+    ) -> dict[str, str] | None:
+        if not _enabled() or not detect(str(event.get("prompt") or "")):
+            return None
+        system_prompt = str(event.get("systemPrompt") or "").rstrip()
+        return {
+            "system_prompt": f"{system_prompt}\n\n{PLACEHOLDER_GUIDANCE}"
+            if system_prompt
+            else PLACEHOLDER_GUIDANCE
+        }
+
+    pi.on("before_agent_start", on_before_agent_start)
 
     async def on_context(event: dict[str, Any], ctx: Any) -> dict[str, Any] | None:
         if not _enabled():
