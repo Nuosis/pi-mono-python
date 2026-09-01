@@ -11,6 +11,7 @@ import asyncio
 import json
 import subprocess
 import sys
+import threading
 from typing import Any, Callable
 
 from .types import RpcResponse, RpcSessionState, RpcSlashCommand
@@ -52,6 +53,8 @@ class RpcClient:
         self._pending_requests: dict[str, asyncio.Future[RpcResponse]] = {}
         self._request_id = 0
         self._stderr = ""
+        self._stderr_lock = threading.Lock()
+        self._stderr_thread: threading.Thread | None = None
         self._reader_task: asyncio.Task | None = None
         self._stdin_lock = asyncio.Lock()
         self._exit_error: RuntimeError | None = None
@@ -84,6 +87,16 @@ class RpcClient:
             stderr=subprocess.PIPE,
         )
 
+        # Drain stderr on its own thread, continuously and independently of
+        # stdout. Reading it only after a stdout line arrives deadlocks: an
+        # agent that fills the 64KB stderr pipe before emitting a stdout line
+        # blocks on the write, so no stdout line ever comes, so stderr is never
+        # drained and the run hangs forever.
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr, name="rpc-stderr-drain", daemon=True
+        )
+        self._stderr_thread.start()
+
         # Start reader task
         loop = asyncio.get_event_loop()
         self._reader_task = loop.create_task(self._read_loop())
@@ -93,7 +106,7 @@ class RpcClient:
         if self._process.poll() is not None:
             raise RuntimeError(
                 f"Agent process exited immediately with code {self._process.returncode}."
-                f" Stderr: {self._stderr}"
+                f" Stderr: {self.get_stderr()}"
             )
 
     async def stop(self) -> None:
@@ -117,6 +130,11 @@ class RpcClient:
         except asyncio.TimeoutError:
             self._process.kill()
 
+        if self._stderr_thread is not None:
+            # The pipe closes when the process dies, which ends the drain loop.
+            self._stderr_thread.join(timeout=2.0)
+            self._stderr_thread = None
+
         self._process = None
         self._pending_requests.clear()
 
@@ -135,7 +153,8 @@ class RpcClient:
     onEvent = on_event
 
     def get_stderr(self) -> str:
-        return self._stderr
+        with self._stderr_lock:
+            return self._stderr
 
     getStderr = get_stderr
 
@@ -313,7 +332,7 @@ class RpcClient:
             await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
             raise TimeoutError(
-                f"Timeout waiting for agent to become idle. Stderr: {self._stderr}"
+                f"Timeout waiting for agent to become idle. Stderr: {self.get_stderr()}"
             )
         finally:
             unsubscribe()
@@ -335,7 +354,7 @@ class RpcClient:
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
             raise TimeoutError(
-                f"Timeout collecting events. Stderr: {self._stderr}"
+                f"Timeout collecting events. Stderr: {self.get_stderr()}"
             )
         finally:
             unsubscribe()
@@ -365,6 +384,24 @@ class RpcClient:
     # Internal
     # =========================================================================
 
+    #: Keep only the tail of stderr. It exists for error messages, and a
+    #: chatty agent would otherwise grow it without bound over a long run.
+    _STDERR_CAP = 64 * 1024
+
+    def _drain_stderr(self) -> None:
+        """Read the agent's stderr to EOF on a dedicated thread."""
+        process = self._process
+        if process is None or process.stderr is None:
+            return
+        try:
+            for chunk in iter(lambda: process.stderr.read1(4096), b""):  # type: ignore[attr-defined]
+                text = chunk.decode(errors="replace")
+                with self._stderr_lock:
+                    self._stderr = (self._stderr + text)[-self._STDERR_CAP:]
+        except Exception:
+            # The pipe closing under us during shutdown is expected.
+            pass
+
     async def _read_loop(self) -> None:
         """Background task reading stdout from the agent process."""
         loop = asyncio.get_event_loop()
@@ -374,15 +411,6 @@ class RpcClient:
             if not line_bytes:
                 break
             reader.feed(line_bytes)
-
-            # Collect stderr
-            if self._process and self._process.stderr:
-                try:
-                    chunk = self._process.stderr.read1(4096)  # type: ignore[attr-defined]
-                    if chunk:
-                        self._stderr += chunk.decode(errors="replace")
-                except Exception:
-                    pass
         reader.end()
         if self._process and self._process.poll() is not None:
             self._exit_error = self._create_process_exit_error(self._process.returncode, None)
@@ -431,13 +459,13 @@ class RpcClient:
             except asyncio.TimeoutError:
                 self._pending_requests.pop(req_id, None)
                 raise TimeoutError(
-                    f"Timeout waiting for response to {command['type']}. Stderr: {self._stderr}"
+                    f"Timeout waiting for response to {command['type']}. Stderr: {self.get_stderr()}"
                 )
 
         return await _do_send()
 
     def _create_process_exit_error(self, code: int | None, signal: str | None) -> RuntimeError:
-        return RuntimeError(f"Agent process exited (code={code} signal={signal}). Stderr: {self._stderr}")
+        return RuntimeError(f"Agent process exited (code={code} signal={signal}). Stderr: {self.get_stderr()}")
 
     def _reject_pending_requests(self, error: BaseException) -> None:
         for future in self._pending_requests.values():

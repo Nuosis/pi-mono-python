@@ -603,6 +603,79 @@ class TestRpcClientAPI:
         assert cancelled == [True]
 
     @pytest.mark.asyncio
+    async def test_rpc_client_survives_a_child_that_floods_stderr_before_stdout(self, tmp_path):
+        """Regression: stderr was drained only after a stdout line arrived.
+
+        A child that fills the OS pipe buffer for stderr (64KB on macOS and
+        Linux) before writing anything to stdout blocks forever on that
+        write. The client sat in ``stdout.readline()`` waiting for a line
+        the child could never send, and never drained the stderr that would
+        have unblocked it. Every multi-turn eval run hung on this.
+
+        ``uv run`` resolution noise and provider warnings go to stderr, so
+        this is the ordinary case, not a contrived one.
+        """
+        from pi_coding_agent.modes.rpc.client import RpcClient, RpcClientOptions
+
+        child = tmp_path / "child.py"
+        child.write_text(
+            "\n".join(
+                [
+                    "import json, sys",
+                    # 256KB — four times the pipe buffer, before any stdout.
+                    "sys.stderr.write('x' * (256 * 1024))",
+                    "sys.stderr.flush()",
+                    "for line in sys.stdin:",
+                    "    req = json.loads(line)",
+                    "    sys.stdout.write(json.dumps({",
+                    "        'type': 'response', 'id': req['id'], 'success': True,",
+                    "        'command': req['type'], 'data': {'commands': [{'name': 'ok'}]},",
+                    "    }) + '\\n')",
+                    "    sys.stdout.flush()",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        client = RpcClient(RpcClientOptions(cli_path=str(child)))
+
+        await client.start()
+        try:
+            commands = await asyncio.wait_for(client.getCommands(), timeout=20)
+        finally:
+            await client.stop()
+
+        assert commands == [{"name": "ok"}]
+        # The flood was captured, and capped rather than held whole.
+        stderr = client.get_stderr()
+        assert stderr, "stderr should have been collected on its own thread"
+        assert len(stderr) <= RpcClient._STDERR_CAP
+
+    @pytest.mark.asyncio
+    async def test_rpc_client_stderr_is_capped_not_unbounded(self, tmp_path):
+        from pi_coding_agent.modes.rpc.client import RpcClient, RpcClientOptions
+
+        child = tmp_path / "child.py"
+        child.write_text(
+            "\n".join(
+                [
+                    "import sys, time",
+                    "sys.stderr.write('y' * (RpcCap := 300 * 1024))",
+                    "sys.stderr.flush()",
+                    "time.sleep(0.3)",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        client = RpcClient(RpcClientOptions(cli_path=str(child)))
+        await client.start()
+        await asyncio.sleep(0.5)
+        await client.stop()
+
+        stderr = client.get_stderr()
+        assert 0 < len(stderr) <= RpcClient._STDERR_CAP
+        assert stderr.endswith("y"), "the tail is what gets kept, not the head"
+
+    @pytest.mark.asyncio
     async def test_rpc_client_rejects_in_flight_request_when_child_process_exits(self, tmp_path):
         from pi_coding_agent.modes.rpc.client import RpcClient, RpcClientOptions
 

@@ -70,6 +70,42 @@ def test_session_vault_becomes_the_filter_vault(tmp_path, monkeypatch):
     assert detokenize(token) == "Call me at +1 415-555-0132"
 
 
+@pytest.mark.asyncio
+async def test_agent_is_told_that_pii_placeholders_are_usable_values(
+    tmp_path, monkeypatch
+):
+    pi = _start_extension(tmp_path, monkeypatch, "session-placeholder-guidance")
+
+    result = await pi.handlers["before_agent_start"](
+        {
+            "prompt": "Create the customer with email Steph_gray@live.com",
+            "systemPrompt": "You are an academy assistant.",
+        },
+        SimpleNamespace(session_id="session-placeholder-guidance"),
+    )
+
+    assert result["system_prompt"].startswith("You are an academy assistant.\n\n")
+    assert "[PII:EMAIL:1]" in result["system_prompt"]
+    assert "complete usable source values" in result["system_prompt"]
+    assert "Copy them unchanged" in result["system_prompt"]
+    assert "Steph_gray@live.com" not in result["system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_agent_gets_no_placeholder_guidance_without_pii(tmp_path, monkeypatch):
+    pi = _start_extension(tmp_path, monkeypatch, "session-no-placeholder-guidance")
+
+    result = await pi.handlers["before_agent_start"](
+        {
+            "prompt": "List the available teaching slots",
+            "systemPrompt": "You are an academy assistant.",
+        },
+        SimpleNamespace(session_id="session-no-placeholder-guidance"),
+    )
+
+    assert result is None
+
+
 def test_streamed_text_delta_is_restored_before_render(tmp_path, monkeypatch):
     _start_extension(tmp_path, monkeypatch, "session-render-2")
     vault = clarity_pii.get_active_vault()
