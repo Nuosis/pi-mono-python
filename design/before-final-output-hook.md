@@ -74,7 +74,7 @@ boundary consistently across deployments.
 
 ## Version adoption
 
-The capability first ships in `tau-by-clarity==0.56.39`. Agents with exact Tau
+The capability first ships in `tau-by-clarity==0.57.0`. Agents with exact Tau
 pins must move to that version or later. Agents using a range must refresh their
 lock file. A future agent receives the capability automatically from any later
 Tau version, but final-output correction remains off until `BeforeFinalOutput`
