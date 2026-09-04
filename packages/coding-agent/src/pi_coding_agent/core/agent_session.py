@@ -218,6 +218,16 @@ class AgentSession:
         convert_to_llm_fn = wrap_convert_to_llm(self._settings_manager.get_block_images())
 
         # Create Agent with convert_to_llm and transform_context
+        try:
+            from pi_agent.hooks import load_hooks
+
+            before_final_output = (
+                self._before_final_output
+                if load_hooks("BeforeFinalOutput", self.cwd)
+                else None
+            )
+        except Exception:  # noqa: BLE001
+            before_final_output = None
         opts = AgentOptions(
             get_api_key=self._resolve_api_key,
             convert_to_llm=convert_to_llm_fn,
@@ -225,6 +235,7 @@ class AgentSession:
             on_payload=self._on_provider_payload,
             on_response=self._on_provider_response,
             prepareNextTurn=self._prepare_next_turn,
+            beforeFinalOutput=before_final_output,
             beforeToolCall=self._before_tool_call,
             afterToolCall=self._after_tool_call,
         )
@@ -951,6 +962,28 @@ class AgentSession:
         except Exception:  # noqa: BLE001
             self._restore_after_turn_end_finalization()
         return None
+
+    async def _before_final_output(
+        self,
+        hook_context: dict[str, Any],
+        signal: asyncio.Event | None = None,
+    ) -> Any | None:
+        """Run the native final-output hook before response events are emitted."""
+        del signal
+        # A queued steering or follow-up message means this candidate is not the
+        # final output for the active run. Leave it untouched and keep working.
+        if self._agent.has_queued_messages():
+            return None
+        try:
+            from pi_agent.hooks import apply_before_final_output
+
+            return apply_before_final_output(
+                hook_context.get("message"),
+                self.session_id,
+                self.cwd,
+            )
+        except Exception:  # noqa: BLE001
+            return None
 
     def _restore_after_turn_end_finalization(self) -> None:
         if self._turn_end_original_system_prompt is not None:

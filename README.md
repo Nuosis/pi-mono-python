@@ -266,6 +266,23 @@ At runtime the loader resolves the same file at
 `<repo>/skills/agent-build-pattern/SKILL.md` (dev). Disable per-run with
 `PI_NO_BUNDLED_SKILLS=1`.
 
+### Native final-output hook
+
+`BeforeFinalOutput` is a core agent-loop hook, not an extension event. When it
+is configured in `.tau/hooks.json`, Tau buffers a tool-free assistant candidate,
+runs the hook, and only then emits and persists the returned text. Tool-call,
+error, and aborted responses do not pass through the replacement hook.
+
+The hook receives `hook_event_name`, `session_id`, `cwd`, and
+`last_assistant_message`. It may return either
+`hookSpecificOutput.replacementText` or `hookSpecificOutput.appendText`.
+The proof configuration under `packages/coding-agent/examples/hooks/` selects
+Tau's built-in probe and replaces the candidate with a temporary Spanish proof
+response ending in `TURN_END_HOOK_FIRED`. It is deliberately only a boundary
+test, not a final writing policy.
+See [the deployment contract](design/before-final-output-hook.md) for the
+portable configuration and adoption steps.
+
 ---
 
 ## Privacy — Tau by Clarity (default ON) — `pi_coding_agent.clarity_pii`

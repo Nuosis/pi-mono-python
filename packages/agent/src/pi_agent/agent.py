@@ -71,6 +71,8 @@ class AgentOptions:
         prepare_next_turn: Callable | None = None,
         shouldStopAfterTurn: Callable | None = None,
         should_stop_after_turn: Callable | None = None,
+        beforeFinalOutput: Callable | None = None,
+        before_final_output: Callable | None = None,
         beforeToolCall: Callable | None = None,
         afterToolCall: Callable | None = None,
         before_tool_call: Callable | None = None,
@@ -93,6 +95,7 @@ class AgentOptions:
         self.toolExecution = tool_execution or toolExecution
         self.prepareNextTurn = prepareNextTurn or prepare_next_turn
         self.shouldStopAfterTurn = shouldStopAfterTurn or should_stop_after_turn
+        self.beforeFinalOutput = beforeFinalOutput or before_final_output
         self.beforeToolCall = beforeToolCall or before_tool_call
         self.afterToolCall = afterToolCall or after_tool_call
 
@@ -149,6 +152,7 @@ class Agent:
         self.toolExecution: str = opts.toolExecution
         self.prepareNextTurn = opts.prepareNextTurn
         self.shouldStopAfterTurn = opts.shouldStopAfterTurn
+        self.beforeFinalOutput = opts.beforeFinalOutput
         self.beforeToolCall = opts.beforeToolCall
         self.afterToolCall = opts.afterToolCall
 
@@ -434,6 +438,7 @@ class Agent:
             get_follow_up_messages=self._async_dequeue_follow_up,
             prepare_next_turn=self.prepareNextTurn,
             should_stop_after_turn=self.shouldStopAfterTurn,
+            before_final_output=self.beforeFinalOutput,
             toolExecution=self.toolExecution,
             before_tool_call=self.beforeToolCall,
             after_tool_call=self.afterToolCall,

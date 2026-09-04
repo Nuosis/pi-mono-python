@@ -116,6 +116,74 @@ async def test_agent_loop_basic():
     assert "message_end" in event_types
 
 
+@pytest.mark.asyncio
+async def test_before_final_output_hook_replaces_buffered_response_before_emission():
+    """The source hook sees only a terminal candidate and no draft is emitted."""
+    from pi_ai import get_model
+
+    model = get_model("anthropic", "claude-3-5-sonnet-20241022")
+    context = AgentContext(messages=[])
+    prompts = [make_user_message("Prove the terminal hook fires")]
+    hook_inputs = []
+
+    async def add_probe_word(hook_context, signal=None):
+        del signal
+        draft = hook_context["message"]
+        hook_inputs.append(draft.content[0].text)
+        return draft.model_copy(
+            update={
+                "content": [
+                    TextContent(
+                        type="text",
+                        text=f"{draft.content[0].text} TURN_END_HOOK_FIRED",
+                    )
+                ]
+            }
+        )
+
+    config = AgentLoopConfig(
+        model=model,
+        convert_to_llm=lambda msgs: [
+            message
+            for message in msgs
+            if hasattr(message, "role")
+            and message.role in ("user", "assistant", "toolResult")
+        ],
+        before_final_output=add_probe_word,
+    )
+
+    events = []
+    stream = agent_loop(prompts, context, config, stream_fn=_mock_stream_fn)
+    async for event in stream:
+        events.append(event)
+
+    assistant_events = [
+        event
+        for event in events
+        if event.type in {"message_start", "message_update", "message_end"}
+        and getattr(getattr(event, "message", None), "role", None) == "assistant"
+    ]
+    emitted_text = [
+        block.text
+        for event in assistant_events
+        for block in getattr(event.message, "content", [])
+        if isinstance(block, TextContent)
+    ]
+
+    assert hook_inputs == ["Hi!"]
+    assert [event.type for event in assistant_events] == [
+        "message_start",
+        "message_end",
+    ]
+    assert emitted_text == [
+        "Hi! TURN_END_HOOK_FIRED",
+        "Hi! TURN_END_HOOK_FIRED",
+    ]
+    assert events.index(assistant_events[-1]) < next(
+        index for index, event in enumerate(events) if event.type == "turn_end"
+    )
+
+
 def test_agent_loop_config_accepts_provider_specific_reasoning_level():
     """Provider-compatible models may use non-OpenAI reasoning labels."""
     from pi_ai import get_model
@@ -183,6 +251,12 @@ async def test_agent_loop_with_tool():
 
     # Mock stream that returns a tool call, then after tool result, returns text
     call_count = [0]
+    final_output_hook_inputs = []
+
+    async def observe_final_output(hook_context, signal=None):
+        del signal
+        final_output_hook_inputs.append(hook_context["message"].content[0].text)
+        return None
 
     async def _stream_with_tool(m, ctx, opts=None):
         call_count[0] += 1
@@ -220,6 +294,7 @@ async def test_agent_loop_with_tool():
     config = AgentLoopConfig(
         model=model,
         convert_to_llm=lambda msgs: [m for m in msgs if hasattr(m, "role") and m.role in ("user", "assistant", "toolResult")],
+        before_final_output=observe_final_output,
     )
 
     stream = agent_loop(prompts, context, config, stream_fn=_stream_with_tool)
@@ -231,6 +306,7 @@ async def test_agent_loop_with_tool():
     assert tool_executed[0] == {"a": 2, "b": 3}
     assert "tool_execution_start" in event_types
     assert "tool_execution_end" in event_types
+    assert final_output_hook_inputs == ["5"]
 
 
 @pytest.mark.asyncio

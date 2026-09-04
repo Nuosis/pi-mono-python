@@ -350,6 +350,68 @@ async def test_turn_end_hook_finalizes_only_the_finished_answer(agent_session, t
 
 
 @pytest.mark.asyncio
+async def test_native_before_final_output_hook_emits_only_the_probe_word_response(
+    session_dir,
+    monkeypatch,
+):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    hook_dir = Path(session_dir) / ".tau"
+    hook_dir.mkdir()
+    (hook_dir / "hooks.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "BeforeFinalOutput": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "builtin",
+                                    "name": "final_output_probe",
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    session = AgentSession(
+        cwd=session_dir,
+        model=get_model("anthropic", "claude-3-5-sonnet-20241022"),
+        settings=Settings(auto_compact=False),
+        session_manager=SessionManager.create(
+            cwd=session_dir,
+            session_dir=session_dir,
+        ),
+    )
+    session._agent.stream_fn = _mock_stream_fn
+    events = []
+    session.subscribe(events.append)
+
+    await session.prompt("Prove the source hook fires.")
+
+    assistant_events = [
+        event
+        for event in events
+        if event.type in {"message_start", "message_update", "message_end"}
+        and getattr(getattr(event, "message", None), "role", None) == "assistant"
+    ]
+    assistant_messages = [
+        message
+        for message in session._session_manager.get_messages()
+        if message.get("role") == "assistant"
+    ]
+    assert [event.type for event in assistant_events] == [
+        "message_start",
+        "message_end",
+    ]
+    assert assistant_messages[-1]["content"][-1]["text"] == (
+        "PRUEBA: el borrador interno fue reemplazado. TURN_END_HOOK_FIRED"
+    )
+
+
+@pytest.mark.asyncio
 async def test_agent_session_set_model(agent_session):
     new_model = get_model("openai", "gpt-5.4-nano")
     # set_model is now async (validates API key); use _agent.set_model for unit tests

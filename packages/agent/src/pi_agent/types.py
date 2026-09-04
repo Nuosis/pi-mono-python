@@ -86,6 +86,19 @@ class AgentLoopConfig(SimpleStreamOptions):
     should_stop_after_turn: Callable[[dict[str, Any]], bool | Awaitable[bool]] | None = None
     shouldStopAfterTurn: Callable[[dict[str, Any]], bool | Awaitable[bool]] | None = None
 
+    # Called only after the model has produced a tool-free assistant message,
+    # but before that message is emitted to consumers. When configured, the
+    # response is buffered until this hook returns so a replacement cannot leak
+    # a draft through message_update events first.
+    before_final_output: Callable[
+        [dict[str, Any], asyncio.Event | None],
+        AgentMessage | None | Awaitable[AgentMessage | None],
+    ] | None = None
+    beforeFinalOutput: Callable[
+        [dict[str, Any], asyncio.Event | None],
+        AgentMessage | None | Awaitable[AgentMessage | None],
+    ] | None = None
+
     # Tool execution mode. Defaults to TypeScript parity: parallel.
     toolExecution: str = "parallel"
 

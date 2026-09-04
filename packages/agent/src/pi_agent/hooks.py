@@ -26,6 +26,9 @@ Config, first match wins:
        "PreGeneration": [{"hooks": [{"type": "command",
                                      "command": "/path/to/inject.sh",
                                      "timeout": 10}]}],
+       "BeforeFinalOutput": [{"hooks": [{"type": "command",
+                                          "command": "/path/to/finalize.py",
+                                          "timeout": 15}]}],
        "Stop":          [{"hooks": [{"type": "command",
                                      "command": "/path/to/audit.py",
                                      "timeout": 15}]}]}}
@@ -33,6 +36,11 @@ Config, first match wins:
 A PreGeneration hook prints JSON on stdout; its
 hookSpecificOutput.additionalContext is appended to the final user message of
 the outgoing payload — the same semantic as UserPromptSubmit.
+
+A BeforeFinalOutput hook runs in the core agent loop after a tool-free response
+has finished generating but before any part of it is emitted or persisted. Its
+``replacementText`` replaces the candidate, while ``appendText`` provides a
+minimal way to prove the boundary with a sentinel word.
 
 A TurnEnd hook runs after the working response has no tool calls. Its
 ``additionalContext`` is added to the system prompt for one tool-disabled
@@ -52,6 +60,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 _MAX_OUTPUT = 256 * 1024
+_FINAL_OUTPUT_PROBE = "final_output_probe"
+_FINAL_OUTPUT_PROBE_TEXT = (
+    "PRUEBA: el borrador interno fue reemplazado. TURN_END_HOOK_FIRED"
+)
 
 
 def _config_path(cwd: str | None = None) -> Path | None:
@@ -75,11 +87,26 @@ def load_hooks(event: str, cwd: str | None = None) -> list[dict]:
         for hook in group.get("hooks", []) or []:
             if hook.get("type") == "command" and hook.get("command"):
                 out.append(hook)
+            elif (
+                hook.get("type") == "builtin"
+                and hook.get("name") == _FINAL_OUTPUT_PROBE
+            ):
+                out.append(hook)
     return out
 
 
 def run_hook(hook: dict, payload: dict) -> dict | None:
     """Run one command hook. Never raises; a broken hook must not break a turn."""
+    if hook.get("type") == "builtin":
+        if hook.get("name") != _FINAL_OUTPUT_PROBE:
+            return None
+        if payload.get("hook_event_name") != "BeforeFinalOutput":
+            return None
+        return {
+            "hookSpecificOutput": {
+                "replacementText": _FINAL_OUTPUT_PROBE_TEXT,
+            }
+        }
     try:
         proc = subprocess.run(
             hook["command"], shell=True, input=json.dumps(payload),
@@ -161,6 +188,66 @@ def gather_turn_end(
             "</draft_to_finalize>"
         ),
     }
+
+
+def apply_before_final_output(
+    message: Any,
+    session_id: str | None,
+    cwd: str | None = None,
+) -> Any | None:
+    """Apply the native, pre-emission final-output hook to one candidate.
+
+    Returning ``None`` means no configured hook replaced the candidate. Hook
+    failures remain fail-open, matching the other command lifecycle hooks.
+    """
+    text = _extract_text(message).strip()
+    if not text:
+        return None
+    replacement: str | None = None
+    for hook in load_hooks("BeforeFinalOutput", cwd):
+        result = run_hook(
+            hook,
+            {
+                "hook_event_name": "BeforeFinalOutput",
+                "session_id": session_id or "",
+                "cwd": cwd or os.getcwd(),
+                "last_assistant_message": text,
+            },
+        )
+        if not isinstance(result, dict):
+            continue
+        specific = result.get("hookSpecificOutput") or {}
+        if not isinstance(specific, dict):
+            continue
+        replacement_text = specific.get("replacementText")
+        append_text = specific.get("appendText")
+        if isinstance(replacement_text, str) and replacement_text.strip():
+            replacement = replacement_text.strip()
+        elif isinstance(append_text, str) and append_text.strip():
+            replacement = f"{replacement or text} {append_text.strip()}"
+    if replacement is None:
+        return None
+    return _replace_text_content(message, replacement)
+
+
+def _replace_text_content(message: Any, replacement: str) -> Any:
+    """Replace delivered text while preserving non-text response metadata."""
+    from pi_ai.types import TextContent
+
+    content = getattr(message, "content", None)
+    if not isinstance(content, list) or not hasattr(message, "model_copy"):
+        return message
+    non_text = [
+        block
+        for block in content
+        if not (
+            isinstance(block, TextContent)
+            or (isinstance(block, dict) and block.get("type") == "text")
+        )
+    ]
+    return message.model_copy(
+        update={"content": [*non_text, TextContent(type="text", text=replacement)]}
+    )
 
 
 def _append_to_last_user_message(params: Any, text: str) -> bool:

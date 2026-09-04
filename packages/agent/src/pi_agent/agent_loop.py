@@ -251,13 +251,23 @@ async def _run_loop(
 
             # Stream assistant response
             _emit_run_state(ev_stream, "waiting_on_model", phase="model")
-            message = await _stream_assistant_response(
-                current_context, config, cancel_event, ev_stream, stream_fn
+            before_final_output = (
+                config.before_final_output or config.beforeFinalOutput
             )
-            new_messages.append(message)
+            message = await _stream_assistant_response(
+                current_context,
+                config,
+                cancel_event,
+                ev_stream,
+                stream_fn,
+                emit_events=before_final_output is None,
+            )
 
             generation_failure = generation_error_details(message)
             if message.stop_reason in ("error", "aborted"):
+                if before_final_output is not None:
+                    _emit_complete_assistant_message(ev_stream, message)
+                new_messages.append(message)
                 _emit_run_state(
                     ev_stream,
                     (
@@ -287,6 +297,30 @@ async def _run_loop(
             # Check for tool calls
             tool_calls = [c for c in message.content if isinstance(c, ToolCall)]
             has_more_tool_calls = len(tool_calls) > 0
+
+            if not has_more_tool_calls and before_final_output is not None:
+                replacement = before_final_output(
+                    {
+                        "message": message,
+                        "context": current_context,
+                        "new_messages": new_messages,
+                        "newMessages": new_messages,
+                    },
+                    cancel_event,
+                )
+                if inspect.isawaitable(replacement):
+                    replacement = await replacement
+                if replacement is not None:
+                    if getattr(replacement, "role", None) != "assistant":
+                        raise TypeError(
+                            "before_final_output must return an assistant message or None"
+                        )
+                    message = replacement
+                    current_context.messages[-1] = message
+
+            if before_final_output is not None:
+                _emit_complete_assistant_message(ev_stream, message)
+            new_messages.append(message)
 
             tool_results: list[ToolResultMessage] = []
             mid_batch_steering: list[Any] = []
@@ -393,6 +427,8 @@ async def _stream_assistant_response(
     cancel_event: asyncio.Event | None,
     ev_stream: EventStream[AgentEvent, list[AgentMessage]],
     stream_fn: StreamFn | None,
+    *,
+    emit_events: bool = True,
 ) -> AssistantMessage:
     """
     Stream an assistant response from the LLM.
@@ -460,7 +496,8 @@ async def _stream_assistant_response(
             partial_message = event.partial
             context.messages.append(partial_message)
             added_partial = True
-            ev_stream.push(AgentEventMessageStart(message=partial_message))
+            if emit_events:
+                ev_stream.push(AgentEventMessageStart(message=partial_message))
 
         elif event.type in (
             "text_start", "text_delta", "text_end",
@@ -470,10 +507,11 @@ async def _stream_assistant_response(
             if partial_message is not None:
                 partial_message = event.partial
                 context.messages[-1] = partial_message
-                ev_stream.push(AgentEventMessageUpdate(
-                    message=partial_message,
-                    assistant_message_event=event,
-                ))
+                if emit_events:
+                    ev_stream.push(AgentEventMessageUpdate(
+                        message=partial_message,
+                        assistant_message_event=event,
+                    ))
 
         elif event.type in ("done", "error"):
             final_message = event.message if event.type == "done" else event.error
@@ -484,9 +522,10 @@ async def _stream_assistant_response(
                 context.messages[-1] = final_message
             else:
                 context.messages.append(final_message)
-            if not added_partial:
+            if emit_events and not added_partial:
                 ev_stream.push(AgentEventMessageStart(message=final_message))
-            ev_stream.push(AgentEventMessageEnd(message=final_message))
+            if emit_events:
+                ev_stream.push(AgentEventMessageEnd(message=final_message))
             return final_message
 
     # Fallback: return partial if no done/error event
@@ -496,6 +535,15 @@ async def _stream_assistant_response(
         return partial_message
 
     raise RuntimeError("Stream ended without a final message")
+
+
+def _emit_complete_assistant_message(
+    ev_stream: EventStream[AgentEvent, list[AgentMessage]],
+    message: AssistantMessage,
+) -> None:
+    """Publish one buffered assistant message after final-output interception."""
+    ev_stream.push(AgentEventMessageStart(message=message))
+    ev_stream.push(AgentEventMessageEnd(message=message))
 
 
 async def _execute_tool_calls(

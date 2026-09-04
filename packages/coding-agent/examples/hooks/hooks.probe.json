@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "BeforeFinalOutput": [
+      {
+        "hooks": [
+          {
+            "type": "builtin",
+            "name": "final_output_probe"
+          }
+        ]
+      }
+    ]
+  }
+}
