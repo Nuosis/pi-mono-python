@@ -80,3 +80,16 @@ class TestOtherRecognizersUnaffected:
 
     def test_ipv4_still_detected(self):
         assert "IP_ADDRESS" in _types("host 192.168.0.1")
+
+
+def test_uuid_routing_ids_survive_pii_tokenization_alongside_real_phone():
+    from pi_coding_agent.clarity_pii.vault import Vault
+
+    identifier = '0d400000-0000-4000-8000-000000000006'
+    text = f'Executor {identifier}; contact +1 250-555-0199; numeric 0000-4000-8000'
+    vault = Vault()
+    protected = vault.tokenize(text)
+    assert identifier in protected
+    assert '+1 250-555-0199' not in protected
+    assert protected.endswith('[PII:PHONE:2]')
+    assert vault.detokenize(protected) == text
