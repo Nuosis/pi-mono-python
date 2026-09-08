@@ -58,6 +58,11 @@ class Vault:
         # UUIDs are opaque routing identities. Their numeric segments can look
         # like phone numbers; keep their spans intact even when the same digits
         # occur as real PII elsewhere in the message.
+        # An enclosing PII value (for example UUID@example.com) still owns its
+        # full span. Tokenize it before protecting standalone routing IDs.
+        for value, etype in sorted(detect(text), key=lambda p: len(p[0]), reverse=True):
+            if _UUID_RE.search(value) and not _UUID_RE.fullmatch(value):
+                text = text.replace(value, self.token_for(value, etype))
         parts = _UUID_RE.split(text)
         for index in range(0, len(parts), 2):
             part = parts[index]

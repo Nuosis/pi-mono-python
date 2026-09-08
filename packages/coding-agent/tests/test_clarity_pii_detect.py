@@ -93,3 +93,17 @@ def test_uuid_routing_ids_survive_pii_tokenization_alongside_real_phone():
     assert '+1 250-555-0199' not in protected
     assert protected.endswith('[PII:PHONE:2]')
     assert vault.detokenize(protected) == text
+
+
+def test_uuid_inside_email_remains_pii():
+    from pi_coding_agent.clarity_pii.vault import Vault
+
+    identifier = '0d400000-0000-4000-8000-000000000006'
+    for email in (identifier + '@example.test', identifier + '+ops@example.test'):
+        vault = Vault()
+        text = f'Executor {identifier}; email {email}'
+        protected = vault.tokenize(text)
+        assert email not in protected
+        assert identifier in protected
+        assert '[PII:EMAIL:' in protected
+        assert vault.detokenize(protected) == text
