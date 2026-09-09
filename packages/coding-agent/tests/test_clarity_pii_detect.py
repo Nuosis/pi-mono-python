@@ -107,3 +107,31 @@ def test_uuid_inside_email_remains_pii():
         assert identifier in protected
         assert '[PII:EMAIL:' in protected
         assert vault.detokenize(protected) == text
+
+
+def test_sha256_file_ids_survive_pii_tokenization_with_real_card_protected():
+    from pi_coding_agent.clarity_pii.vault import Vault
+
+    digest = '730b45c159508bad86907654977712fadaaaac842ab06271c0f138de384b07dd'
+    card = '4111111111111111'
+    containing_card = 'a' * 24 + card + 'b' * 24
+    text = f'file-{digest}.json hash={containing_card}; card {card}'
+    vault = Vault()
+    protected = vault.tokenize(text)
+    assert digest in protected
+    assert containing_card in protected
+    assert protected.endswith('[PII:CC:1]')
+    assert vault.detokenize(protected) == text
+
+
+def test_sha256_inside_email_is_still_protected():
+    from pi_coding_agent.clarity_pii.vault import Vault
+
+    digest = '730b45c159508bad86907654977712fadaaaac842ab06271c0f138de384b07dd'
+    text = f'file {digest}; email {digest}@example.test'
+    vault = Vault()
+    protected = vault.tokenize(text)
+    assert digest in protected
+    assert digest + '@example.test' not in protected
+    assert '[PII:EMAIL:' in protected
+    assert vault.detokenize(protected) == text

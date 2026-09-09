@@ -22,9 +22,10 @@ from typing import Any
 from .detect import detect, label_for, make_token
 
 ARTIFACT_SCHEMA = "tau-by-clarity/pii-vault@1"
-_UUID_RE = re.compile(
-    r"(?<![\w-])([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?![\w-])"
+_OPAQUE_ID_RE = re.compile(
+    r"((?<![\w-])[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?![\w-])|"
+    r"(?<!\w)(?=[0-9a-fA-F]{0,63}[a-fA-F])[0-9a-fA-F]{64}(?!\w))"
 )
 _TOOL_TOKEN_RE = re.compile(r"\[PII:[A-Z_]+:\d+\]?")
 
@@ -55,15 +56,15 @@ class Vault:
     def tokenize(self, text: str) -> str:
         if not text:
             return text
-        # UUIDs are opaque routing identities. Their numeric segments can look
-        # like phone numbers; keep their spans intact even when the same digits
+        # UUIDs and SHA-256 file digests are opaque identities. Their numeric
+        # segments can look like phone or card numbers; keep their spans intact even when the same digits
         # occur as real PII elsewhere in the message.
         # An enclosing PII value (for example UUID@example.com) still owns its
         # full span. Tokenize it before protecting standalone routing IDs.
         for value, etype in sorted(detect(text), key=lambda p: len(p[0]), reverse=True):
-            if _UUID_RE.search(value) and not _UUID_RE.fullmatch(value):
+            if _OPAQUE_ID_RE.search(value) and not _OPAQUE_ID_RE.fullmatch(value):
                 text = text.replace(value, self.token_for(value, etype))
-        parts = _UUID_RE.split(text)
+        parts = _OPAQUE_ID_RE.split(text)
         for index in range(0, len(parts), 2):
             part = parts[index]
             for value, etype in sorted(detect(part), key=lambda p: len(p[0]), reverse=True):
