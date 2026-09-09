@@ -80,3 +80,58 @@ class TestOtherRecognizersUnaffected:
 
     def test_ipv4_still_detected(self):
         assert "IP_ADDRESS" in _types("host 192.168.0.1")
+
+
+def test_uuid_routing_ids_survive_pii_tokenization_alongside_real_phone():
+    from pi_coding_agent.clarity_pii.vault import Vault
+
+    identifier = '0d400000-0000-4000-8000-000000000006'
+    text = f'Executor {identifier}; contact +1 250-555-0199; numeric 0000-4000-8000'
+    vault = Vault()
+    protected = vault.tokenize(text)
+    assert identifier in protected
+    assert '+1 250-555-0199' not in protected
+    assert protected.endswith('[PII:PHONE:2]')
+    assert vault.detokenize(protected) == text
+
+
+def test_uuid_inside_email_remains_pii():
+    from pi_coding_agent.clarity_pii.vault import Vault
+
+    identifier = '0d400000-0000-4000-8000-000000000006'
+    for email in (identifier + '@example.test', identifier + '+ops@example.test'):
+        vault = Vault()
+        text = f'Executor {identifier}; email {email}'
+        protected = vault.tokenize(text)
+        assert email not in protected
+        assert identifier in protected
+        assert '[PII:EMAIL:' in protected
+        assert vault.detokenize(protected) == text
+
+
+def test_sha256_file_ids_survive_pii_tokenization_with_real_card_protected():
+    from pi_coding_agent.clarity_pii.vault import Vault
+
+    digest = '730b45c159508bad86907654977712fadaaaac842ab06271c0f138de384b07dd'
+    card = '4111111111111111'
+    containing_card = 'a' * 24 + card + 'b' * 24
+    text = f'file-{digest}.json hash={containing_card}; card {card}'
+    vault = Vault()
+    protected = vault.tokenize(text)
+    assert digest in protected
+    assert containing_card in protected
+    assert protected.endswith('[PII:CC:1]')
+    assert vault.detokenize(protected) == text
+
+
+def test_sha256_inside_email_is_still_protected():
+    from pi_coding_agent.clarity_pii.vault import Vault
+
+    digest = '730b45c159508bad86907654977712fadaaaac842ab06271c0f138de384b07dd'
+    text = f'file {digest}; email {digest}@example.test'
+    vault = Vault()
+    protected = vault.tokenize(text)
+    assert digest in protected
+    assert digest + '@example.test' not in protected
+    assert '[PII:EMAIL:' in protected
+    assert vault.detokenize(protected) == text

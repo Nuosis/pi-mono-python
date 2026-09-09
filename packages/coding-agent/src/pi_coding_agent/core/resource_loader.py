@@ -379,7 +379,7 @@ class DefaultResourceLoader:
         self._path_metadata = {}
 
         # Load extensions (from extension dirs + additional paths)
-        if not self._no_extensions:
+        if not self._no_extensions or self._additional_extension_paths or self._extension_factories:
             await self._load_extensions()
 
         # Load skills
@@ -481,11 +481,10 @@ class DefaultResourceLoader:
         Mirrors extension loading in DefaultResourceLoader.reload() in TypeScript.
         """
         ext_paths = (
-            get_extension_discovery_paths(
-                self._cwd,
-                self._agent_dir,
-                inherit_global=self._inherit_global,
-            )
+            ([] if self._no_extensions else
+             get_extension_discovery_paths(
+                 self._cwd, self._agent_dir, inherit_global=self._inherit_global,
+             ))
             + self._additional_extension_paths
         )
         ext_paths = self._merge_paths([], ext_paths)

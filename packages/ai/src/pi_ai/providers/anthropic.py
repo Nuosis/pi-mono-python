@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import re
 import time
@@ -752,7 +753,7 @@ async def stream_simple(
                             type="toolCall",
                             id=block.id,
                             name=tc_name,
-                            arguments={},
+                            arguments=block.input if isinstance(getattr(block, "input", None), dict) else {},
                         )
                         content_blocks.append(tc)
                         tool_arg_buffers[cb_idx] = ""
@@ -816,7 +817,13 @@ async def stream_simple(
                     elif isinstance(blk, ThinkingContent):
                         yield EventThinkingEnd(type="thinking_end", content_index=cb_idx, content=blk.thinking, partial=partial)
                     elif isinstance(blk, ToolCall):
-                        raw = tool_arg_buffers.get(cb_idx, "{}")
+                        raw = tool_arg_buffers.get(cb_idx, "")
+                        # An argument-free tool can complete with input={} in
+                        # content_block_start and no input_json_delta events.
+                        # Only absent deltas use that initial input; malformed
+                        # nonempty deltas retain their normal parse failure.
+                        if raw == "":
+                            raw = json.dumps(blk.arguments)
                         parse_result = parse_streaming_json_result(raw)
                         parsed = parse_result.value or {}
                         content_blocks[cb_idx] = ToolCall(
